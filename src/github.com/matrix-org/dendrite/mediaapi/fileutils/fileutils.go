@@ -19,10 +19,8 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
-	"hash"
 	"io"
 	"io/ioutil"
-	"net/http"
 	"os"
 	"path"
 	"path/filepath"
@@ -86,104 +84,29 @@ var (
 	errWrite          = fmt.Errorf("failed to write file to disk")
 )
 
-// writeToResponse takes bytesToWrite bytes from buffer and writes them to respWriter
-// Returns bytes written and an error. In case of error, the number of bytes written will be 0.
-func writeToResponse(respWriter http.ResponseWriter, buffer []byte, bytesToWrite int) (int64, error) {
-	bytesWritten, respErr := respWriter.Write(buffer[:bytesToWrite])
-	if bytesWritten != bytesToWrite || (respErr != nil && respErr != io.EOF) {
-		return 0, errResponse
-	}
-	return int64(bytesWritten), nil
-}
-
-// writeToDiskAndHasher takes bytesToWrite bytes from buffer and writes them to tmpFileWriter and hasher.
-// Returns bytes written and an error. In case of error, including if writing would exceed maxFileSizeBytes,
-// the number of bytes written will be 0.
-func writeToDiskAndHasher(tmpFileWriter *bufio.Writer, hasher hash.Hash, bytesWritten int64, maxFileSizeBytes types.FileSizeBytes, buffer []byte, bytesToWrite int) (int64, error) {
-	// if larger than maxFileSizeBytes then stop writing to disk and discard cached file
-	if bytesWritten+int64(bytesToWrite) > int64(maxFileSizeBytes) {
-		return 0, ErrFileIsTooLarge
-	}
-	// write to hasher and to disk
-	bytesTemp, writeErr := tmpFileWriter.Write(buffer[:bytesToWrite])
-	bytesHashed, hashErr := hasher.Write(buffer[:bytesToWrite])
-	if writeErr != nil && writeErr != io.EOF || bytesTemp != bytesToWrite || bytesTemp != bytesHashed {
-		return 0, errWrite
-	} else if hashErr != nil && hashErr != io.EOF {
-		return 0, errHash
-	}
-	return int64(bytesTemp), nil
-}
-
 // WriteTempFile writes to a new temporary file
-// * creates a temporary file
-// * writes data from reqReader to disk and simultaneously hash it
-// * the amount of data written to disk and hashed is limited by maxFileSizeBytes
-// * if a respWriter is supplied, the data is also simultaneously written to that
-// * data written to the respWriter is _not_ limited to maxFileSizeBytes such that
-//   the homeserver can proxy files larger than it is willing to cache
-// Returns all of the hash sum, bytes written to disk, bytes proxied, and temporary directory path, or an error.
-func WriteTempFile(reqReader io.Reader, maxFileSizeBytes types.FileSizeBytes, absBasePath types.Path, respWriter http.ResponseWriter) (types.Base64Hash, types.FileSizeBytes, types.FileSizeBytes, types.Path, error) {
-	// create the temporary file writer
+func WriteTempFile(reqReader io.Reader, maxFileSizeBytes types.FileSizeBytes, absBasePath types.Path) (types.Base64Hash, types.FileSizeBytes, types.Path, error) {
 	tmpFileWriter, tmpFile, tmpDir, err := createTempFileWriter(absBasePath)
 	if err != nil {
-		return "", -1, -1, "", err
+		return "", -1, "", err
 	}
 	defer tmpFile.Close()
 
-	// The file data is hashed and the hash is returned. The hash is useful as a
+	limitedReader := io.LimitReader(reqReader, int64(maxFileSizeBytes))
+	// Hash the file data. The hash will be returned. The hash is useful as a
 	// method of deduplicating files to save storage, as well as a way to conduct
 	// integrity checks on the file data in the repository.
 	hasher := sha256.New()
-
-	// bytesResponded is the total number of bytes written to the response to the client request
-	// bytesWritten is the total number of bytes written to disk
-	var bytesResponded, bytesWritten int64 = 0, 0
-	var bytesTemp int64
-	var copyError error
-	// Note: the buffer size is the same as is used in io.Copy()
-	buffer := make([]byte, 32*1024)
-	for {
-		// read from remote request's response body
-		bytesRead, readErr := reqReader.Read(buffer)
-		if bytesRead > 0 {
-			// Note: This code allows proxying files larger than maxFileSizeBytes!
-			// write to client request's response body
-			if respWriter != nil {
-				bytesTemp, copyError = writeToResponse(respWriter, buffer, bytesRead)
-				bytesResponded += bytesTemp
-				if copyError != nil {
-					break
-				}
-			}
-			if copyError == nil {
-				// Note: if we get here then copyError != ErrFileIsTooLarge && copyError != errWrite
-				//   as if copyError == errResponse || copyError == errWrite then we would have broken
-				//   out of the loop and there are no other cases
-				bytesTemp, copyError = writeToDiskAndHasher(tmpFileWriter, hasher, bytesWritten, maxFileSizeBytes, buffer, (bytesRead))
-				bytesWritten += bytesTemp
-				// If we do not have a respWriter then we are only writing to the hasher and tmpFileWriter. In that case, if we get an error, we need to break.
-				if respWriter == nil && copyError != nil {
-					break
-				}
-			}
-		}
-		if readErr != nil {
-			if readErr != io.EOF {
-				copyError = errRead
-			}
-			break
-		}
-	}
-
-	if copyError != nil {
-		return "", -1, -1, "", copyError
+	teeReader := io.TeeReader(limitedReader, hasher)
+	bytesWritten, err := io.Copy(tmpFileWriter, teeReader)
+	if err != nil && err != io.EOF {
+		return "", -1, "", err
 	}
 
 	tmpFileWriter.Flush()
 
 	hash := hasher.Sum(nil)
-	return types.Base64Hash(base64.URLEncoding.EncodeToString(hash[:])), types.FileSizeBytes(bytesResponded), types.FileSizeBytes(bytesWritten), tmpDir, nil
+	return types.Base64Hash(base64.URLEncoding.EncodeToString(hash[:])), types.FileSizeBytes(bytesWritten), tmpDir, nil
 }
 
 // GetPathFromBase64Hash evaluates the path to a media file from its Base64Hash
