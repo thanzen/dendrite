@@ -21,6 +21,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"regexp"
@@ -181,13 +182,12 @@ func (r *downloadRequest) getMediaMetadata(db *storage.Database) (*types.MediaMe
 // Returns a util.JSONResponse error in case of error
 func (r *downloadRequest) respondFromLocalFile(w http.ResponseWriter, absBasePath types.Path) *util.JSONResponse {
 	r.Logger.WithFields(log.Fields{
-		"MediaID":             r.MediaMetadata.MediaID,
-		"Origin":              r.MediaMetadata.Origin,
-		"UploadName":          r.MediaMetadata.UploadName,
-		"Base64Hash":          r.MediaMetadata.Base64Hash,
-		"FileSizeBytes":       r.MediaMetadata.FileSizeBytes,
-		"Content-Type":        r.MediaMetadata.ContentType,
-		"Content-Disposition": r.MediaMetadata.ContentDisposition,
+		"MediaID":       r.MediaMetadata.MediaID,
+		"Origin":        r.MediaMetadata.Origin,
+		"UploadName":    r.MediaMetadata.UploadName,
+		"Base64Hash":    r.MediaMetadata.Base64Hash,
+		"FileSizeBytes": r.MediaMetadata.FileSizeBytes,
+		"Content-Type":  r.MediaMetadata.ContentType,
 	}).Info("Responding with file")
 
 	filePath, err := fileutils.GetPathFromBase64Hash(r.MediaMetadata.Base64Hash, absBasePath)
@@ -391,13 +391,12 @@ func (r *downloadRequest) getRemoteFile(absBasePath types.Path, maxFileSizeBytes
 	isError = false
 
 	r.Logger.WithFields(log.Fields{
-		"MediaID":             r.MediaMetadata.MediaID,
-		"Origin":              r.MediaMetadata.Origin,
-		"Base64Hash":          r.MediaMetadata.Base64Hash,
-		"UploadName":          r.MediaMetadata.UploadName,
-		"FileSizeBytes":       r.MediaMetadata.FileSizeBytes,
-		"Content-Type":        r.MediaMetadata.ContentType,
-		"Content-Disposition": r.MediaMetadata.ContentDisposition,
+		"MediaID":       r.MediaMetadata.MediaID,
+		"Origin":        r.MediaMetadata.Origin,
+		"Base64Hash":    r.MediaMetadata.Base64Hash,
+		"UploadName":    r.MediaMetadata.UploadName,
+		"FileSizeBytes": r.MediaMetadata.FileSizeBytes,
+		"Content-Type":  r.MediaMetadata.ContentType,
 	}).Info("Storing file metadata to media repository database")
 
 	// FIXME: timeout db request
@@ -420,13 +419,12 @@ func (r *downloadRequest) getRemoteFile(absBasePath types.Path, maxFileSizeBytes
 	// TODO: generate thumbnails
 
 	r.Logger.WithFields(log.Fields{
-		"MediaID":             r.MediaMetadata.MediaID,
-		"Origin":              r.MediaMetadata.Origin,
-		"UploadName":          r.MediaMetadata.UploadName,
-		"Base64Hash":          r.MediaMetadata.Base64Hash,
-		"FileSizeBytes":       r.MediaMetadata.FileSizeBytes,
-		"Content-Type":        r.MediaMetadata.ContentType,
-		"Content-Disposition": r.MediaMetadata.ContentDisposition,
+		"MediaID":       r.MediaMetadata.MediaID,
+		"Origin":        r.MediaMetadata.Origin,
+		"UploadName":    r.MediaMetadata.UploadName,
+		"Base64Hash":    r.MediaMetadata.Base64Hash,
+		"FileSizeBytes": r.MediaMetadata.FileSizeBytes,
+		"Content-Type":  r.MediaMetadata.ContentType,
 	}).Infof("Remote file cached")
 
 	return nil
@@ -452,9 +450,7 @@ func (r *downloadRequest) fetchRemoteFile(absBasePath types.Path, maxFileSizeByt
 	}
 	r.MediaMetadata.FileSizeBytes = types.FileSizeBytes(contentLength)
 	r.MediaMetadata.ContentType = types.ContentType(resp.Header.Get("Content-Type"))
-	r.MediaMetadata.ContentDisposition = types.ContentDisposition(resp.Header.Get("Content-Disposition"))
-	// FIXME: parse from Content-Disposition header if possible, else fall back
-	//r.MediaMetadata.UploadName          = types.Filename()
+	r.MediaMetadata.UploadName = types.Filename(contentDispositionToFilename(resp.Header.Get("Content-Disposition")))
 
 	r.Logger.WithFields(log.Fields{
 		"MediaID": r.MediaMetadata.MediaID,
@@ -464,16 +460,13 @@ func (r *downloadRequest) fetchRemoteFile(absBasePath types.Path, maxFileSizeByt
 	// The file data is hashed but is NOT used as the MediaID, unlike in Upload. The hash is useful as a
 	// method of deduplicating files to save storage, as well as a way to conduct
 	// integrity checks on the file data in the repository.
-	hash, bytesWritten, tmpDir, copyError := fileutils.WriteTempFile(resp.Body, maxFileSizeBytes, absBasePath)
-	if copyError != nil {
-		logFields := log.Fields{
-			"MediaID": r.MediaMetadata.MediaID,
-			"Origin":  r.MediaMetadata.Origin,
-		}
-		if copyError == fileutils.ErrFileIsTooLarge {
-			logFields["MaxFileSizeBytes"] = maxFileSizeBytes
-		}
-		r.Logger.WithError(copyError).WithFields(logFields).Warn("Error while downloading file from remote server")
+	hash, bytesWritten, tmpDir, err := fileutils.WriteTempFile(resp.Body, maxFileSizeBytes, absBasePath)
+	if err != nil {
+		r.Logger.WithError(err).WithFields(log.Fields{
+			"MediaID":          r.MediaMetadata.MediaID,
+			"Origin":           r.MediaMetadata.Origin,
+			"MaxFileSizeBytes": maxFileSizeBytes,
+		}).Warn("Error while downloading file from remote server")
 		fileutils.RemoveDir(tmpDir, r.Logger)
 		return "", false, &util.JSONResponse{
 			Code: 502,
@@ -581,4 +574,19 @@ func getMatrixURLs(serverName gomatrixserverlib.ServerName) []string {
 	// TODO: Order based on priority and weight.
 
 	return results
+}
+
+var contentDispositionRegex = regexp.MustCompile("filename([*])?=(utf-8'')?([A-Za-z0-9._-]+)")
+
+func contentDispositionToFilename(contentDisposition string) types.Filename {
+	filename := ""
+	if matches := contentDispositionRegex.FindStringSubmatch(contentDisposition); len(matches) == 4 {
+		// Note: the filename should already be escaped. If not, unescape should be close to a no-op. This way filename is sure to be safe.
+		unescaped, err := url.PathUnescape(matches[3])
+		if err != nil {
+			unescaped = matches[3]
+		}
+		filename = url.PathEscape(unescaped)
+	}
+	return types.Filename(filename)
 }

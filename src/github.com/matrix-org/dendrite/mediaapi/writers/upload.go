@@ -17,6 +17,7 @@ package writers
 import (
 	"database/sql"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"path"
@@ -56,67 +57,7 @@ func Upload(req *http.Request, cfg *config.MediaAPI, db *storage.Database) util.
 		return *resErr
 	}
 
-	r.Logger.WithFields(log.Fields{
-		"Origin":              r.MediaMetadata.Origin,
-		"UploadName":          r.MediaMetadata.UploadName,
-		"FileSizeBytes":       r.MediaMetadata.FileSizeBytes,
-		"Content-Type":        r.MediaMetadata.ContentType,
-		"Content-Disposition": r.MediaMetadata.ContentDisposition,
-	}).Info("Uploading file")
-
-	// The file data is hashed and the hash is used as the MediaID. The hash is useful as a
-	// method of deduplicating files to save storage, as well as a way to conduct
-	// integrity checks on the file data in the repository.
-	hash, bytesWritten, tmpDir, copyError := fileutils.WriteTempFile(req.Body, cfg.MaxFileSizeBytes, cfg.AbsBasePath)
-	if copyError != nil {
-		logFields := log.Fields{
-			"Origin":  r.MediaMetadata.Origin,
-			"MediaID": r.MediaMetadata.MediaID,
-		}
-		if copyError == fileutils.ErrFileIsTooLarge {
-			logFields["MaxFileSizeBytes"] = cfg.MaxFileSizeBytes
-		}
-		r.Logger.WithError(copyError).WithFields(logFields).Warn("Error while transferring file")
-		fileutils.RemoveDir(tmpDir, r.Logger)
-		return util.JSONResponse{
-			Code: 400,
-			JSON: jsonerror.Unknown(fmt.Sprintf("Failed to upload")),
-		}
-	}
-
-	r.MediaMetadata.FileSizeBytes = bytesWritten
-	r.MediaMetadata.Base64Hash = hash
-	r.MediaMetadata.MediaID = types.MediaID(hash)
-
-	r.Logger.WithFields(log.Fields{
-		"MediaID":             r.MediaMetadata.MediaID,
-		"Origin":              r.MediaMetadata.Origin,
-		"Base64Hash":          r.MediaMetadata.Base64Hash,
-		"UploadName":          r.MediaMetadata.UploadName,
-		"FileSizeBytes":       r.MediaMetadata.FileSizeBytes,
-		"Content-Type":        r.MediaMetadata.ContentType,
-		"Content-Disposition": r.MediaMetadata.ContentDisposition,
-	}).Info("File uploaded")
-
-	// check if we already have a record of the media in our database and if so, we can remove the temporary directory
-	mediaMetadata, err := db.GetMediaMetadata(r.MediaMetadata.MediaID, r.MediaMetadata.Origin)
-	if err == nil {
-		r.MediaMetadata = mediaMetadata
-		fileutils.RemoveDir(tmpDir, r.Logger)
-		return util.JSONResponse{
-			Code: 200,
-			JSON: uploadResponse{
-				ContentURI: fmt.Sprintf("mxc://%s/%s", cfg.ServerName, r.MediaMetadata.MediaID),
-			},
-		}
-	} else if err != sql.ErrNoRows {
-		r.Logger.WithError(err).WithField("MediaID", r.MediaMetadata.MediaID).Warn("Failed to query database")
-	}
-
-	// TODO: generate thumbnails
-
-	resErr = r.storeFileAndMetadata(tmpDir, cfg.AbsBasePath, db)
-	if resErr != nil {
+	if resErr = r.doUpload(req.Body, cfg, db); resErr != nil {
 		return *resErr
 	}
 
@@ -141,11 +82,10 @@ func parseAndValidateRequest(req *http.Request, cfg *config.MediaAPI) (*uploadRe
 
 	r := &uploadRequest{
 		MediaMetadata: &types.MediaMetadata{
-			Origin:             cfg.ServerName,
-			ContentDisposition: types.ContentDisposition(req.Header.Get("Content-Disposition")),
-			FileSizeBytes:      types.FileSizeBytes(req.ContentLength),
-			ContentType:        types.ContentType(req.Header.Get("Content-Type")),
-			UploadName:         types.Filename(url.PathEscape(req.FormValue("filename"))),
+			Origin:        cfg.ServerName,
+			FileSizeBytes: types.FileSizeBytes(req.ContentLength),
+			ContentType:   types.ContentType(req.Header.Get("Content-Type")),
+			UploadName:    types.Filename(url.PathEscape(req.FormValue("filename"))),
 		},
 		Logger: util.GetLogger(req.Context()),
 	}
@@ -154,13 +94,69 @@ func parseAndValidateRequest(req *http.Request, cfg *config.MediaAPI) (*uploadRe
 		return nil, resErr
 	}
 
-	if len(r.MediaMetadata.UploadName) > 0 {
-		r.MediaMetadata.ContentDisposition = types.ContentDisposition(
-			"inline; filename*=utf-8''" + string(r.MediaMetadata.UploadName),
-		)
+	return r, nil
+}
+
+func (r *uploadRequest) doUpload(reqReader io.Reader, cfg *config.MediaAPI, db *storage.Database) *util.JSONResponse {
+	r.Logger.WithFields(log.Fields{
+		"Origin":        r.MediaMetadata.Origin,
+		"UploadName":    r.MediaMetadata.UploadName,
+		"FileSizeBytes": r.MediaMetadata.FileSizeBytes,
+		"Content-Type":  r.MediaMetadata.ContentType,
+	}).Info("Uploading file")
+
+	// The file data is hashed and the hash is used as the MediaID. The hash is useful as a
+	// method of deduplicating files to save storage, as well as a way to conduct
+	// integrity checks on the file data in the repository.
+	hash, bytesWritten, tmpDir, err := fileutils.WriteTempFile(reqReader, cfg.MaxFileSizeBytes, cfg.AbsBasePath)
+	if err != nil {
+		r.Logger.WithError(err).WithFields(log.Fields{
+			"Origin":           r.MediaMetadata.Origin,
+			"MediaID":          r.MediaMetadata.MediaID,
+			"MaxFileSizeBytes": cfg.MaxFileSizeBytes,
+		}).Warn("Error while transferring file")
+		fileutils.RemoveDir(tmpDir, r.Logger)
+		return &util.JSONResponse{
+			Code: 400,
+			JSON: jsonerror.Unknown(fmt.Sprintf("Failed to upload")),
+		}
 	}
 
-	return r, nil
+	r.MediaMetadata.FileSizeBytes = bytesWritten
+	r.MediaMetadata.Base64Hash = hash
+	r.MediaMetadata.MediaID = types.MediaID(hash)
+
+	r.Logger.WithFields(log.Fields{
+		"MediaID":       r.MediaMetadata.MediaID,
+		"Origin":        r.MediaMetadata.Origin,
+		"Base64Hash":    r.MediaMetadata.Base64Hash,
+		"UploadName":    r.MediaMetadata.UploadName,
+		"FileSizeBytes": r.MediaMetadata.FileSizeBytes,
+		"Content-Type":  r.MediaMetadata.ContentType,
+	}).Info("File uploaded")
+
+	// check if we already have a record of the media in our database and if so, we can remove the temporary directory
+	mediaMetadata, err := db.GetMediaMetadata(r.MediaMetadata.MediaID, r.MediaMetadata.Origin)
+	if err == nil {
+		r.MediaMetadata = mediaMetadata
+		fileutils.RemoveDir(tmpDir, r.Logger)
+		return &util.JSONResponse{
+			Code: 200,
+			JSON: uploadResponse{
+				ContentURI: fmt.Sprintf("mxc://%s/%s", cfg.ServerName, r.MediaMetadata.MediaID),
+			},
+		}
+	} else if err != sql.ErrNoRows {
+		r.Logger.WithError(err).WithField("MediaID", r.MediaMetadata.MediaID).Warn("Failed to query database")
+	}
+
+	// TODO: generate thumbnails
+
+	if resErr := r.storeFileAndMetadata(tmpDir, cfg.AbsBasePath, db); resErr != nil {
+		return resErr
+	}
+
+	return nil
 }
 
 // Validate validates the uploadRequest fields
@@ -214,13 +210,11 @@ func (r *uploadRequest) Validate(maxFileSizeBytes types.FileSizeBytes) *util.JSO
 	return nil
 }
 
-// storeFileAndMetadata first moves a temporary file named content from tmpDir to its
-// final path (see getPathFromMediaMetadata for details.) Once the file is moved, the
-// metadata about the file is written into the media repository database. This order
-// of operations is important as it avoids metadata entering the database before the file
-// is ready and if we fail to move the file, it never gets added to the database.
-// In case of any error, appropriate files and directories are cleaned up a
-// util.JSONResponse error is returned.
+// storeFileAndMetadata moves the temporary file to its final path based on metadata and stores the metadata in the database
+// See getPathFromMediaMetadata in fileutils for details of the final path.
+// The order of operations is important as it avoids metadata entering the database before the file
+// is ready, and if we fail to move the file, it never gets added to the database.
+// Returns a util.JSONResponse error and cleans up directories in case of error.
 func (r *uploadRequest) storeFileAndMetadata(tmpDir types.Path, absBasePath types.Path, db *storage.Database) *util.JSONResponse {
 	finalPath, duplicate, err := fileutils.MoveFileWithHashCheck(tmpDir, r.MediaMetadata, absBasePath, r.Logger)
 	if err != nil {
@@ -240,7 +234,7 @@ func (r *uploadRequest) storeFileAndMetadata(tmpDir types.Path, absBasePath type
 		// there is valid metadata in the database for that file. As such we only
 		// remove the file if it is not a duplicate.
 		if duplicate == false {
-			fileutils.RemoveDir(types.Path(path.Dir(finalPath)), r.Logger)
+			fileutils.RemoveDir(types.Path(path.Dir(string(finalPath))), r.Logger)
 		}
 		return &util.JSONResponse{
 			Code: 400,
