@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package types
+package authtypes
 
-// Account represents a Matrix account on this home server.
-type Account struct {
-	UserID    string
-	Localpart string
-	// TODO: Other flags like IsAdmin, IsGuest
-	// TODO: Device IDs
-	// TODO: Associations (e.g. with application services)
+// Device represents a client's device (mobile, web, etc)
+type Device struct {
+	ID     string
+	UserID string
+	// The access_token granted to this device.
+	// This uniquely identifies the device from all other devices and clients.
+	AccessToken string
+	// TODO: display name, last used timestamp, keys, etc
 }

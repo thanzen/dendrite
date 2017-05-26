@@ -19,6 +19,7 @@ import (
 	"sync"
 
 	"github.com/gorilla/mux"
+	"github.com/matrix-org/dendrite/common"
 	"github.com/matrix-org/dendrite/mediaapi/config"
 	"github.com/matrix-org/dendrite/mediaapi/storage"
 	"github.com/matrix-org/dendrite/mediaapi/types"
@@ -35,12 +36,13 @@ const pathPrefixR0 = "/_matrix/media/v1"
 func Setup(servMux *http.ServeMux, httpClient *http.Client, cfg *config.MediaAPI, db *storage.Database) {
 	apiMux := mux.NewRouter()
 	r0mux := apiMux.PathPrefix(pathPrefixR0).Subrouter()
-	r0mux.Handle("/upload", makeAPI("upload", func(req *http.Request) util.JSONResponse {
+	// FIXME: /upload should use common.MakeAuthAPI()
+	r0mux.Handle("/upload", common.MakeAPI("upload", func(req *http.Request) util.JSONResponse {
 		return writers.Upload(req, cfg, db)
 	}))
 
 	activeRemoteRequests := &types.ActiveRemoteRequests{
-		Set: map[string]*sync.Cond{},
+		MXCToCond: map[string]*sync.Cond{},
 	}
 	r0mux.Handle("/download/{serverName}/{mediaId}",
 		prometheus.InstrumentHandler("download", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -58,10 +60,4 @@ func Setup(servMux *http.ServeMux, httpClient *http.Client, cfg *config.MediaAPI
 
 	servMux.Handle("/metrics", prometheus.Handler())
 	servMux.Handle("/api/", http.StripPrefix("/api", apiMux))
-}
-
-// make a util.JSONRequestHandler function into an http.Handler.
-func makeAPI(metricsName string, f func(*http.Request) util.JSONResponse) http.Handler {
-	h := util.NewJSONRequestHandler(f)
-	return prometheus.InstrumentHandler(metricsName, util.MakeJSONAPI(h))
 }

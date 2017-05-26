@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +37,25 @@ import (
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/util"
 )
+
+const mediaIDCharacters = "A-Za-z0-9_=-"
+
+// Note: unfortunately regex.MustCompile() cannot be assigned to a const
+var mediaIDRegex = regexp.MustCompile("[" + mediaIDCharacters + "]+")
+
+// Error types used by downloadRequest.getMediaMetadata
+// FIXME: make into types
+var (
+	errDBQuery    = fmt.Errorf("error querying database for media")
+	errDBNotFound = fmt.Errorf("media not found")
+)
+
+// downloadRequest metadata included in or derivable from an download request
+// https://matrix.org/docs/spec/client_server/r0.2.0.html#get-matrix-media-r0-download-servername-mediaid
+type downloadRequest struct {
+	MediaMetadata *types.MediaMetadata
+	Logger        *log.Entry
+}
 
 // Download implements /download
 // Files from this server (i.e. origin == cfg.ServerName) are served directly
@@ -72,20 +92,6 @@ func Download(w http.ResponseWriter, req *http.Request, origin gomatrixserverlib
 	}
 }
 
-// downloadRequest metadata included in or derivable from an download request
-// https://matrix.org/docs/spec/client_server/r0.2.0.html#get-matrix-media-r0-download-servername-mediaid
-type downloadRequest struct {
-	MediaMetadata *types.MediaMetadata
-	Logger        *log.Entry
-}
-
-// Error types used by downloadRequest.getMediaMetadata
-// FIXME: make into types
-var (
-	errDBQuery    = fmt.Errorf("error querying database for media")
-	errDBNotFound = fmt.Errorf("media not found")
-)
-
 func (r *downloadRequest) jsonErrorResponse(w http.ResponseWriter, res util.JSONResponse) {
 	// Marshal JSON response into raw bytes to send as the HTTP body
 	resBytes, err := json.Marshal(res.JSON)
@@ -104,14 +110,14 @@ func (r *downloadRequest) jsonErrorResponse(w http.ResponseWriter, res util.JSON
 
 // Validate validates the downloadRequest fields
 func (r *downloadRequest) Validate() *util.JSONResponse {
-	// FIXME: the following errors aren't bad JSON, rather just a bad request path
-	// maybe give the URL pattern in the routing, these are not even possible as the handler would not be hit...?
-	if r.MediaMetadata.MediaID == "" {
+	if mediaIDRegex.MatchString(string(r.MediaMetadata.MediaID)) == false {
 		return &util.JSONResponse{
 			Code: 404,
-			JSON: jsonerror.NotFound("mediaId must be a non-empty string"),
+			JSON: jsonerror.NotFound(fmt.Sprintf("mediaId must be a non-empty string using only characters in %v", mediaIDCharacters)),
 		}
 	}
+	// Note: the origin will be validated either by comparison to the configured server name of this homeserver
+	// or by a DNS SRV record lookup when creating a request for remote files
 	if r.MediaMetadata.Origin == "" {
 		return &util.JSONResponse{
 			Code: 404,
@@ -306,7 +312,7 @@ func (r *downloadRequest) getMediaMetadataForRemoteFile(db *storage.Database, ac
 
 	// Check if there is an active remote request for the file
 	mxcURL := "mxc://" + string(r.MediaMetadata.Origin) + "/" + string(r.MediaMetadata.MediaID)
-	if activeRemoteRequestCondition, ok := activeRemoteRequests.Set[mxcURL]; ok {
+	if activeRemoteRequestCondition, ok := activeRemoteRequests.MXCToCond[mxcURL]; ok {
 		r.Logger.WithFields(log.Fields{
 			"Origin":  r.MediaMetadata.Origin,
 			"MediaID": r.MediaMetadata.MediaID,
@@ -342,7 +348,7 @@ func (r *downloadRequest) getMediaMetadataForRemoteFile(db *storage.Database, ac
 	}
 
 	// No active remote request so create one
-	activeRemoteRequests.Set[mxcURL] = &sync.Cond{L: activeRemoteRequests}
+	activeRemoteRequests.MXCToCond[mxcURL] = &sync.Cond{L: activeRemoteRequests}
 	return nil, nil
 }
 
@@ -358,14 +364,14 @@ func (r *downloadRequest) getRemoteFile(absBasePath types.Path, maxFileSizeBytes
 		}
 		defer activeRemoteRequests.Unlock()
 		mxcURL := "mxc://" + string(r.MediaMetadata.Origin) + "/" + string(r.MediaMetadata.MediaID)
-		if activeRemoteRequestCondition, ok := activeRemoteRequests.Set[mxcURL]; ok {
+		if activeRemoteRequestCondition, ok := activeRemoteRequests.MXCToCond[mxcURL]; ok {
 			r.Logger.WithFields(log.Fields{
 				"Origin":  r.MediaMetadata.Origin,
 				"MediaID": r.MediaMetadata.MediaID,
 			}).Info("Signalling other goroutines waiting for this goroutine to fetch the file.")
 			activeRemoteRequestCondition.Broadcast()
 		}
-		delete(activeRemoteRequests.Set, mxcURL)
+		delete(activeRemoteRequests.MXCToCond, mxcURL)
 	}()
 
 	finalPath, duplicate, resErr := r.fetchRemoteFile(absBasePath, maxFileSizeBytes)

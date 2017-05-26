@@ -83,6 +83,7 @@ func getLastRequestError() error {
 var syncServerConfigFileContents = (`consumer_uris: ["` + kafkaURI + `"]
 roomserver_topic: "` + inputTopic + `"
 database: "` + testDatabase + `"
+server_name: "localhost"
 `)
 
 func defaulting(value, defaultValue string) string {
@@ -130,6 +131,21 @@ func canonicalJSONInput(jsonData []string) []string {
 		jsonData[i] = string(jsonBytes)
 	}
 	return jsonData
+}
+
+func createTestUser(database, username, token string) error {
+	cmd := exec.Command(
+		filepath.Join(filepath.Dir(os.Args[0]), "create-account"),
+		"--database", database,
+		"--username", username,
+		"--token", token,
+	)
+
+	// Send stdout and stderr to our stderr so that we see error messages from
+	// the create-account process
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 // clientEventJSONForOutputRoomEvent parses the given output room event and extracts the 'Event' JSON. It is
@@ -213,6 +229,16 @@ func syncRequestUntilSuccess(done chan error, userID, since, want string) {
 // which will have any termination errors sent down it, followed immediately by the channel being closed.
 func startSyncServer() (*exec.Cmd, chan error) {
 	if err := createDatabase(testDatabaseName); err != nil {
+		panic(err)
+	}
+
+	if err := createTestUser(testDatabase, "alice", "@alice:localhost"); err != nil {
+		panic(err)
+	}
+	if err := createTestUser(testDatabase, "bob", "@bob:localhost"); err != nil {
+		panic(err)
+	}
+	if err := createTestUser(testDatabase, "charlie", "@charlie:localhost"); err != nil {
 		panic(err)
 	}
 

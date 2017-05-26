@@ -19,11 +19,16 @@ import (
 	"net/http"
 
 	"github.com/gorilla/mux"
+	"github.com/matrix-org/dendrite/clientapi/auth/authtypes"
+	"github.com/matrix-org/dendrite/clientapi/auth/storage/accounts"
+	"github.com/matrix-org/dendrite/clientapi/auth/storage/devices"
 	"github.com/matrix-org/dendrite/clientapi/config"
 	"github.com/matrix-org/dendrite/clientapi/producers"
 	"github.com/matrix-org/dendrite/clientapi/readers"
 	"github.com/matrix-org/dendrite/clientapi/writers"
+	"github.com/matrix-org/dendrite/common"
 	"github.com/matrix-org/dendrite/roomserver/api"
+	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/util"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -32,45 +37,64 @@ const pathPrefixR0 = "/_matrix/client/r0"
 
 // Setup registers HTTP handlers with the given ServeMux. It also supplies the given http.Client
 // to clients which need to make outbound HTTP requests.
-func Setup(servMux *http.ServeMux, httpClient *http.Client, cfg config.ClientAPI, producer *producers.RoomserverProducer, queryAPI api.RoomserverQueryAPI) {
+func Setup(
+	servMux *http.ServeMux, httpClient *http.Client, cfg config.ClientAPI,
+	producer *producers.RoomserverProducer, queryAPI api.RoomserverQueryAPI,
+	accountDB *accounts.Database,
+	deviceDB *devices.Database,
+	federation *gomatrixserverlib.FederationClient,
+	keyRing gomatrixserverlib.KeyRing,
+) {
 	apiMux := mux.NewRouter()
 	r0mux := apiMux.PathPrefix(pathPrefixR0).Subrouter()
 	r0mux.Handle("/createRoom",
-		makeAPI("createRoom", func(req *http.Request) util.JSONResponse {
-			return writers.CreateRoom(req, cfg, producer)
+		common.MakeAuthAPI("createRoom", deviceDB, func(req *http.Request, device *authtypes.Device) util.JSONResponse {
+			return writers.CreateRoom(req, device, cfg, producer)
+		}),
+	)
+	r0mux.Handle("/join/{roomIDOrAlias}",
+		common.MakeAuthAPI("join", deviceDB, func(req *http.Request, device *authtypes.Device) util.JSONResponse {
+			vars := mux.Vars(req)
+			return writers.JoinRoomByIDOrAlias(
+				req, device, vars["roomIDOrAlias"], cfg, federation, producer, queryAPI, keyRing,
+			)
 		}),
 	)
 	r0mux.Handle("/rooms/{roomID}/send/{eventType}/{txnID}",
-		makeAPI("send_message", func(req *http.Request) util.JSONResponse {
+		common.MakeAuthAPI("send_message", deviceDB, func(req *http.Request, device *authtypes.Device) util.JSONResponse {
 			vars := mux.Vars(req)
-			return writers.SendEvent(req, vars["roomID"], vars["eventType"], vars["txnID"], nil, cfg, queryAPI, producer)
+			return writers.SendEvent(req, device, vars["roomID"], vars["eventType"], vars["txnID"], nil, cfg, queryAPI, producer)
 		}),
 	)
 	r0mux.Handle("/rooms/{roomID}/state/{eventType}",
-		makeAPI("send_message", func(req *http.Request) util.JSONResponse {
+		common.MakeAuthAPI("send_message", deviceDB, func(req *http.Request, device *authtypes.Device) util.JSONResponse {
 			vars := mux.Vars(req)
 			emptyString := ""
-			return writers.SendEvent(req, vars["roomID"], vars["eventType"], vars["txnID"], &emptyString, cfg, queryAPI, producer)
+			return writers.SendEvent(req, device, vars["roomID"], vars["eventType"], vars["txnID"], &emptyString, cfg, queryAPI, producer)
 		}),
 	)
 	r0mux.Handle("/rooms/{roomID}/state/{eventType}/{stateKey}",
-		makeAPI("send_message", func(req *http.Request) util.JSONResponse {
+		common.MakeAuthAPI("send_message", deviceDB, func(req *http.Request, device *authtypes.Device) util.JSONResponse {
 			vars := mux.Vars(req)
 			stateKey := vars["stateKey"]
-			return writers.SendEvent(req, vars["roomID"], vars["eventType"], vars["txnID"], &stateKey, cfg, queryAPI, producer)
+			return writers.SendEvent(req, device, vars["roomID"], vars["eventType"], vars["txnID"], &stateKey, cfg, queryAPI, producer)
 		}),
 	)
+
+	r0mux.Handle("/register", common.MakeAPI("register", func(req *http.Request) util.JSONResponse {
+		return writers.Register(req, accountDB)
+	}))
 
 	// Stub endpoints required by Riot
 
 	r0mux.Handle("/login",
-		makeAPI("login", func(req *http.Request) util.JSONResponse {
+		common.MakeAPI("login", func(req *http.Request) util.JSONResponse {
 			return readers.Login(req, cfg)
 		}),
 	)
 
 	r0mux.Handle("/pushrules/",
-		makeAPI("push_rules", func(req *http.Request) util.JSONResponse {
+		common.MakeAPI("push_rules", func(req *http.Request) util.JSONResponse {
 			// TODO: Implement push rules API
 			res := json.RawMessage(`{
 					"global": {
@@ -89,7 +113,7 @@ func Setup(servMux *http.ServeMux, httpClient *http.Client, cfg config.ClientAPI
 	)
 
 	r0mux.Handle("/user/{userID}/filter",
-		makeAPI("make_filter", func(req *http.Request) util.JSONResponse {
+		common.MakeAPI("make_filter", func(req *http.Request) util.JSONResponse {
 			// TODO: Persist filter and return filter ID
 			return util.JSONResponse{
 				Code: 200,
@@ -99,7 +123,7 @@ func Setup(servMux *http.ServeMux, httpClient *http.Client, cfg config.ClientAPI
 	)
 
 	r0mux.Handle("/user/{userID}/filter/{filterID}",
-		makeAPI("filter", func(req *http.Request) util.JSONResponse {
+		common.MakeAPI("filter", func(req *http.Request) util.JSONResponse {
 			// TODO: Retrieve filter based on ID
 			return util.JSONResponse{
 				Code: 200,
@@ -111,7 +135,7 @@ func Setup(servMux *http.ServeMux, httpClient *http.Client, cfg config.ClientAPI
 	// Riot user settings
 
 	r0mux.Handle("/profile/{userID}",
-		makeAPI("profile", func(req *http.Request) util.JSONResponse {
+		common.MakeAPI("profile", func(req *http.Request) util.JSONResponse {
 			// TODO: Get profile data for user ID
 			return util.JSONResponse{
 				Code: 200,
@@ -121,7 +145,7 @@ func Setup(servMux *http.ServeMux, httpClient *http.Client, cfg config.ClientAPI
 	)
 
 	r0mux.Handle("/account/3pid",
-		makeAPI("account_3pid", func(req *http.Request) util.JSONResponse {
+		common.MakeAPI("account_3pid", func(req *http.Request) util.JSONResponse {
 			// TODO: Get 3pid data for user ID
 			res := json.RawMessage(`{"threepids":[]}`)
 			return util.JSONResponse{
@@ -133,7 +157,7 @@ func Setup(servMux *http.ServeMux, httpClient *http.Client, cfg config.ClientAPI
 
 	// Riot logs get flooded unless this is handled
 	r0mux.Handle("/presence/{userID}/status",
-		makeAPI("presence", func(req *http.Request) util.JSONResponse {
+		common.MakeAPI("presence", func(req *http.Request) util.JSONResponse {
 			// TODO: Set presence (probably the responsibility of a presence server not clientapi)
 			return util.JSONResponse{
 				Code: 200,
@@ -144,10 +168,4 @@ func Setup(servMux *http.ServeMux, httpClient *http.Client, cfg config.ClientAPI
 
 	servMux.Handle("/metrics", prometheus.Handler())
 	servMux.Handle("/api/", http.StripPrefix("/api", apiMux))
-}
-
-// make a util.JSONRequestHandler function into an http.Handler.
-func makeAPI(metricsName string, f func(*http.Request) util.JSONResponse) http.Handler {
-	h := util.NewJSONRequestHandler(f)
-	return prometheus.InstrumentHandler(metricsName, util.MakeJSONAPI(h))
 }

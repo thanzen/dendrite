@@ -19,11 +19,14 @@ import (
 	"os"
 	"strings"
 
+	"github.com/matrix-org/dendrite/clientapi/auth/storage/accounts"
+	"github.com/matrix-org/dendrite/clientapi/auth/storage/devices"
 	"github.com/matrix-org/dendrite/clientapi/config"
 	"github.com/matrix-org/dendrite/clientapi/producers"
 	"github.com/matrix-org/dendrite/clientapi/routing"
 	"github.com/matrix-org/dendrite/common"
 	"github.com/matrix-org/dendrite/roomserver/api"
+
 	"github.com/matrix-org/gomatrixserverlib"
 
 	log "github.com/Sirupsen/logrus"
@@ -37,6 +40,7 @@ var (
 	clientAPIOutputTopic = os.Getenv("CLIENTAPI_OUTPUT_TOPIC")
 	serverName           = gomatrixserverlib.ServerName(os.Getenv("SERVER_NAME"))
 	serverKey            = os.Getenv("SERVER_KEY")
+	accountDataSource    = os.Getenv("ACCOUNT_DATABASE")
 )
 
 func main() {
@@ -78,8 +82,44 @@ func main() {
 		log.Panicf("Failed to setup kafka producers(%s): %s", cfg.KafkaProducerURIs, err)
 	}
 
-	queryAPI := api.NewRoomserverQueryAPIHTTP(cfg.RoomserverURL, nil)
+	federation := gomatrixserverlib.NewFederationClient(cfg.ServerName, cfg.KeyID, cfg.PrivateKey)
 
-	routing.Setup(http.DefaultServeMux, http.DefaultClient, cfg, roomserverProducer, queryAPI)
+	queryAPI := api.NewRoomserverQueryAPIHTTP(cfg.RoomserverURL, nil)
+	accountDB, err := accounts.NewDatabase(accountDataSource, serverName)
+	if err != nil {
+		log.Panicf("Failed to setup account database(%s): %s", accountDataSource, err.Error())
+	}
+	deviceDB, err := devices.NewDatabase(accountDataSource, serverName)
+	if err != nil {
+		log.Panicf("Failed to setup device database(%s): %s", accountDataSource, err.Error())
+	}
+
+	keyRing := gomatrixserverlib.KeyRing{
+		KeyFetchers: []gomatrixserverlib.KeyFetcher{
+			// TODO: Use perspective key fetchers for production.
+			&gomatrixserverlib.DirectKeyFetcher{federation.Client},
+		},
+		KeyDatabase: &dummyKeyDatabase{},
+	}
+
+	routing.Setup(
+		http.DefaultServeMux, http.DefaultClient, cfg, roomserverProducer,
+		queryAPI, accountDB, deviceDB, federation, keyRing,
+	)
 	log.Fatal(http.ListenAndServe(bindAddr, nil))
+}
+
+// TODO: Implement a proper key database.
+type dummyKeyDatabase struct{}
+
+func (d *dummyKeyDatabase) FetchKeys(
+	requests map[gomatrixserverlib.PublicKeyRequest]gomatrixserverlib.Timestamp,
+) (map[gomatrixserverlib.PublicKeyRequest]gomatrixserverlib.ServerKeys, error) {
+	return nil, nil
+}
+
+func (d *dummyKeyDatabase) StoreKeys(
+	map[gomatrixserverlib.PublicKeyRequest]gomatrixserverlib.ServerKeys,
+) error {
+	return nil
 }
