@@ -110,7 +110,7 @@ func main() {
 
 	if *clientAPIURL == "" {
 		flag.Usage()
-		fmt.Fprintln(os.Stderr, "no --client-api-url specified.")
+		fmt.Fprintln(os.Stderr, "no --client-api-server-url specified.")
 		os.Exit(1)
 	}
 
