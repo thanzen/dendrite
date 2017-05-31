@@ -30,7 +30,7 @@ const thumbnailTemplate = "thumbnail-%vx%v-%v"
 
 // GenerateThumbnails generates the configured thumbnail sizes for the source file
 func GenerateThumbnails(src types.Path, configs []types.ThumbnailSize, logger *log.Entry) error {
-	start := time.Now().UnixNano()
+	start := time.Now()
 	buffer, err := bimg.Read(string(src))
 	if err != nil {
 		logger.WithError(err).WithFields(log.Fields{
@@ -47,15 +47,15 @@ func GenerateThumbnails(src types.Path, configs []types.ThumbnailSize, logger *l
 		}
 	}
 	logger.WithFields(log.Fields{
-		"src":           src,
-		"processTimeNs": time.Now().UnixNano() - start,
+		"src":         src,
+		"processTime": time.Now().Sub(start),
 	}).Info("Generated thumbnails")
 	return nil
 }
 
 // GenerateThumbnail generates the configured thumbnail size for the source file
 func GenerateThumbnail(src types.Path, config types.ThumbnailSize, logger *log.Entry) error {
-	start := time.Now().UnixNano()
+	start := time.Now()
 	buffer, err := bimg.Read(string(src))
 	if err != nil {
 		logger.WithError(err).WithFields(log.Fields{
@@ -70,8 +70,8 @@ func GenerateThumbnail(src types.Path, config types.ThumbnailSize, logger *log.E
 		return err
 	}
 	logger.WithFields(log.Fields{
-		"src":           src,
-		"processTimeNs": time.Now().UnixNano() - start,
+		"src":         src,
+		"processTime": time.Now().Sub(start),
 	}).Info("Generated thumbnail")
 	return nil
 }
