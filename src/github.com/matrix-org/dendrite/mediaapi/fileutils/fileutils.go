@@ -22,7 +22,6 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 
@@ -31,37 +30,22 @@ import (
 )
 
 // GetPathFromBase64Hash evaluates the path to a media file from its Base64Hash
-// If the Base64Hash is long enough, we split it into pieces, creating up to 2 subdirectories
-// for more manageable browsing and use the remainder as the file name.
-// For example, if Base64Hash is 'qwerty', the path will be 'q/w/erty'.
+// 3 subdirectories are created for more manageable browsing and use the remainder as the file name.
+// For example, if Base64Hash is 'qwerty', the path will be 'q/w/erty/file'.
 func GetPathFromBase64Hash(base64Hash types.Base64Hash, absBasePath types.Path) (string, error) {
-	var subPath, fileName string
-
-	hashLen := len(base64Hash)
-
-	switch {
-	case hashLen < 1:
-		return "", fmt.Errorf("Invalid filePath (Base64Hash too short): %q", base64Hash)
-	case hashLen > 255:
+	if len(base64Hash) < 3 {
+		return "", fmt.Errorf("Invalid filePath (Base64Hash too short - min 3 characters): %q", base64Hash)
+	}
+	if len(base64Hash) > 255 {
 		return "", fmt.Errorf("Invalid filePath (Base64Hash too long - max 255 characters): %q", base64Hash)
-	case hashLen < 2:
-		subPath = ""
-		fileName = string(base64Hash)
-	case hashLen < 3:
-		subPath = string(base64Hash[0:1])
-		fileName = string(base64Hash[1:])
-	default:
-		subPath = path.Join(
-			string(base64Hash[0:1]),
-			string(base64Hash[1:2]),
-		)
-		fileName = string(base64Hash[2:])
 	}
 
-	filePath, err := filepath.Abs(path.Join(
+	filePath, err := filepath.Abs(filepath.Join(
 		string(absBasePath),
-		subPath,
-		fileName,
+		string(base64Hash[0:1]),
+		string(base64Hash[1:2]),
+		string(base64Hash[2:]),
+		"file",
 	))
 	if err != nil {
 		return "", fmt.Errorf("Unable to construct filePath: %q", err)
@@ -92,7 +76,9 @@ func MoveFileWithHashCheck(tmpDir types.Path, mediaMetadata *types.MediaMetadata
 	}
 
 	var stat os.FileInfo
-	if stat, err = os.Stat(finalPath); os.IsExist(err) {
+	// Note: The double-negative is intentional as os.IsExist(err) != !os.IsNotExist(err).
+	// The functions are error checkers to be used in different cases.
+	if stat, err = os.Stat(finalPath); !os.IsNotExist(err) {
 		duplicate = true
 		if stat.Size() == int64(mediaMetadata.FileSizeBytes) {
 			return types.Path(finalPath), duplicate, nil
@@ -100,7 +86,7 @@ func MoveFileWithHashCheck(tmpDir types.Path, mediaMetadata *types.MediaMetadata
 		return "", duplicate, fmt.Errorf("downloaded file with hash collision but different file size (%v)", finalPath)
 	}
 	err = moveFile(
-		types.Path(path.Join(string(tmpDir), "content")),
+		types.Path(filepath.Join(string(tmpDir), "content")),
 		types.Path(finalPath),
 	)
 	if err != nil {
@@ -125,6 +111,7 @@ func WriteTempFile(reqReader io.Reader, maxFileSizeBytes types.FileSizeBytes, ab
 	}
 	defer tmpFile.Close()
 
+	// The amount of data read is limited to maxFileSizeBytes. At this point, if there is more data it will be truncated.
 	limitedReader := io.LimitReader(reqReader, int64(maxFileSizeBytes))
 	// Hash the file data. The hash will be returned. The hash is useful as a
 	// method of deduplicating files to save storage, as well as a way to conduct
@@ -144,7 +131,7 @@ func WriteTempFile(reqReader io.Reader, maxFileSizeBytes types.FileSizeBytes, ab
 
 // moveFile attempts to move the file src to dst
 func moveFile(src types.Path, dst types.Path) error {
-	dstDir := path.Dir(string(dst))
+	dstDir := filepath.Dir(string(dst))
 
 	err := os.MkdirAll(dstDir, 0770)
 	if err != nil {
@@ -171,7 +158,7 @@ func createTempFileWriter(absBasePath types.Path) (*bufio.Writer, *os.File, type
 
 // createTempDir creates a tmp/<random string> directory within baseDirectory and returns its path
 func createTempDir(baseDirectory types.Path) (types.Path, error) {
-	baseTmpDir := path.Join(string(baseDirectory), "tmp")
+	baseTmpDir := filepath.Join(string(baseDirectory), "tmp")
 	if err := os.MkdirAll(baseTmpDir, 0770); err != nil {
 		return "", fmt.Errorf("Failed to create base temp dir: %v", err)
 	}
@@ -186,7 +173,7 @@ func createTempDir(baseDirectory types.Path) (types.Path, error) {
 // The caller should flush the writer before closing the file.
 // Returns the file handle as it needs to be closed when writing is complete
 func createFileWriter(directory types.Path, filename types.Filename) (*bufio.Writer, *os.File, error) {
-	filePath := path.Join(string(directory), string(filename))
+	filePath := filepath.Join(string(directory), string(filename))
 	file, err := os.Create(filePath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("Failed to create file: %v", err)

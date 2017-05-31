@@ -28,6 +28,7 @@ import (
 	"github.com/matrix-org/dendrite/mediaapi/config"
 	"github.com/matrix-org/dendrite/mediaapi/fileutils"
 	"github.com/matrix-org/dendrite/mediaapi/storage"
+	"github.com/matrix-org/dendrite/mediaapi/thumbnailer"
 	"github.com/matrix-org/dendrite/mediaapi/types"
 	"github.com/matrix-org/util"
 )
@@ -75,7 +76,7 @@ func Upload(req *http.Request, cfg *config.MediaAPI, db *storage.Database) util.
 func parseAndValidateRequest(req *http.Request, cfg *config.MediaAPI) (*uploadRequest, *util.JSONResponse) {
 	if req.Method != "POST" {
 		return nil, &util.JSONResponse{
-			Code: 400,
+			Code: 405,
 			JSON: jsonerror.Unknown("HTTP request method must be POST."),
 		}
 	}
@@ -90,7 +91,7 @@ func parseAndValidateRequest(req *http.Request, cfg *config.MediaAPI) (*uploadRe
 		Logger: util.GetLogger(req.Context()),
 	}
 
-	if resErr := r.Validate(cfg.MaxFileSizeBytes); resErr != nil {
+	if resErr := r.Validate(*cfg.MaxFileSizeBytes); resErr != nil {
 		return nil, resErr
 	}
 
@@ -108,17 +109,18 @@ func (r *uploadRequest) doUpload(reqReader io.Reader, cfg *config.MediaAPI, db *
 	// The file data is hashed and the hash is used as the MediaID. The hash is useful as a
 	// method of deduplicating files to save storage, as well as a way to conduct
 	// integrity checks on the file data in the repository.
-	hash, bytesWritten, tmpDir, err := fileutils.WriteTempFile(reqReader, cfg.MaxFileSizeBytes, cfg.AbsBasePath)
+	// Data is truncated to maxFileSizeBytes. Content-Length was reported as 0 < Content-Length <= maxFileSizeBytes so this is OK.
+	hash, bytesWritten, tmpDir, err := fileutils.WriteTempFile(reqReader, *cfg.MaxFileSizeBytes, cfg.AbsBasePath)
 	if err != nil {
 		r.Logger.WithError(err).WithFields(log.Fields{
 			"Origin":           r.MediaMetadata.Origin,
 			"MediaID":          r.MediaMetadata.MediaID,
-			"MaxFileSizeBytes": cfg.MaxFileSizeBytes,
+			"MaxFileSizeBytes": *cfg.MaxFileSizeBytes,
 		}).Warn("Error while transferring file")
 		fileutils.RemoveDir(tmpDir, r.Logger)
 		return &util.JSONResponse{
 			Code: 400,
-			JSON: jsonerror.Unknown(fmt.Sprintf("Failed to upload")),
+			JSON: jsonerror.Unknown("Failed to upload"),
 		}
 	}
 
@@ -150,9 +152,7 @@ func (r *uploadRequest) doUpload(reqReader io.Reader, cfg *config.MediaAPI, db *
 		r.Logger.WithError(err).WithField("MediaID", r.MediaMetadata.MediaID).Warn("Failed to query database")
 	}
 
-	// TODO: generate thumbnails
-
-	if resErr := r.storeFileAndMetadata(tmpDir, cfg.AbsBasePath, db); resErr != nil {
+	if resErr := r.storeFileAndMetadata(tmpDir, cfg.AbsBasePath, db, cfg.ThumbnailSizes); resErr != nil {
 		return resErr
 	}
 
@@ -163,13 +163,13 @@ func (r *uploadRequest) doUpload(reqReader io.Reader, cfg *config.MediaAPI, db *
 func (r *uploadRequest) Validate(maxFileSizeBytes types.FileSizeBytes) *util.JSONResponse {
 	if r.MediaMetadata.FileSizeBytes < 1 {
 		return &util.JSONResponse{
-			Code: 400,
+			Code: 411,
 			JSON: jsonerror.Unknown("HTTP Content-Length request header must be greater than zero."),
 		}
 	}
 	if maxFileSizeBytes > 0 && r.MediaMetadata.FileSizeBytes > maxFileSizeBytes {
 		return &util.JSONResponse{
-			Code: 400,
+			Code: 413,
 			JSON: jsonerror.Unknown(fmt.Sprintf("HTTP Content-Length is greater than the maximum allowed upload size (%v).", maxFileSizeBytes)),
 		}
 	}
@@ -215,13 +215,13 @@ func (r *uploadRequest) Validate(maxFileSizeBytes types.FileSizeBytes) *util.JSO
 // The order of operations is important as it avoids metadata entering the database before the file
 // is ready, and if we fail to move the file, it never gets added to the database.
 // Returns a util.JSONResponse error and cleans up directories in case of error.
-func (r *uploadRequest) storeFileAndMetadata(tmpDir types.Path, absBasePath types.Path, db *storage.Database) *util.JSONResponse {
+func (r *uploadRequest) storeFileAndMetadata(tmpDir types.Path, absBasePath types.Path, db *storage.Database, thumbnailSizes []types.ThumbnailSize) *util.JSONResponse {
 	finalPath, duplicate, err := fileutils.MoveFileWithHashCheck(tmpDir, r.MediaMetadata, absBasePath, r.Logger)
 	if err != nil {
 		r.Logger.WithError(err).Error("Failed to move file.")
 		return &util.JSONResponse{
 			Code: 400,
-			JSON: jsonerror.Unknown(fmt.Sprintf("Failed to upload")),
+			JSON: jsonerror.Unknown("Failed to upload"),
 		}
 	}
 	if duplicate {
@@ -238,9 +238,11 @@ func (r *uploadRequest) storeFileAndMetadata(tmpDir types.Path, absBasePath type
 		}
 		return &util.JSONResponse{
 			Code: 400,
-			JSON: jsonerror.Unknown(fmt.Sprintf("Failed to upload")),
+			JSON: jsonerror.Unknown("Failed to upload"),
 		}
 	}
+
+	go thumbnailer.GenerateThumbnails(finalPath, thumbnailSizes, r.Logger)
 
 	return nil
 }

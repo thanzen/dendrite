@@ -21,7 +21,7 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path"
+	"path/filepath"
 	"strconv"
 	"sync"
 
@@ -30,80 +30,18 @@ import (
 	"github.com/matrix-org/dendrite/mediaapi/config"
 	"github.com/matrix-org/dendrite/mediaapi/fileutils"
 	"github.com/matrix-org/dendrite/mediaapi/storage"
+	"github.com/matrix-org/dendrite/mediaapi/thumbnailer"
 	"github.com/matrix-org/dendrite/mediaapi/types"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/util"
-	"gopkg.in/h2non/bimg.v1"
 )
 
 // thumbnailRequest metadata included in or derivable from an thumbnail request
 // http://matrix.org/docs/spec/client_server/r0.2.0.html#get-matrix-media-r0-thumbnail-servername-mediaid
 type thumbnailRequest struct {
 	MediaMetadata *types.MediaMetadata
-	Width         int
-	Height        int
-	ResizeMethod  string
+	ThumbnailSize types.ThumbnailSize
 	Logger        *log.Entry
-}
-
-// resize scales an image to fit within the provided width and height
-// If the source aspect ratio is different to the target dimensions, one edge will be smaller than requested
-// If crop is set to true, the image will be scaled to fill the width and height with any excess being cropped off
-func resize(dst, src types.Path, w, h int, crop bool, logger *log.Entry) error {
-	buffer, err := bimg.Read(string(src))
-	if err != nil {
-		return err
-	}
-	inImage := bimg.NewImage(buffer)
-
-	options := bimg.Options{
-		Type:    bimg.JPEG,
-		Quality: 85,
-	}
-	if crop {
-		options.Width = w
-		options.Height = h
-		options.Crop = true
-	} else {
-		var inSize bimg.ImageSize
-		inSize, err = inImage.Size()
-		if err != nil {
-			return err
-		}
-
-		inAR := float64(inSize.Width) / float64(inSize.Height)
-		outAR := float64(w) / float64(h)
-
-		logger.WithFields(log.Fields{
-			"inAR":     inAR,
-			"outAR":    outAR,
-			"inWidth":  inSize.Width,
-			"inHeight": inSize.Height,
-		}).Info("Resizing image")
-
-		if inAR > outAR {
-			// input has wider AR than requested output so use requested width and calculate height to match input AR
-			options.Width = w
-			options.Height = int(float64(w) / inAR)
-		} else {
-			// input has narrower AR than requested output so use requested height and calculate width to match input AR
-			options.Width = int(float64(h) * inAR)
-			options.Height = h
-		}
-	}
-
-	logger.WithFields(log.Fields{
-		"Width":  options.Width,
-		"Height": options.Height,
-		"Crop":   options.Crop,
-	}).Info("Resizing image")
-
-	newImage, err := inImage.Process(options)
-	if err != nil {
-		return err
-	}
-
-	return bimg.Write(string(dst), newImage)
 }
 
 // Thumbnail implements /thumbnail
@@ -118,8 +56,10 @@ func Thumbnail(w http.ResponseWriter, req *http.Request, origin gomatrixserverli
 			MediaID: mediaID,
 			Origin:  origin,
 		},
-		ResizeMethod: req.FormValue("method"),
-		Logger:       util.GetLogger(req.Context()),
+		ThumbnailSize: types.ThumbnailSize{
+			ResizeMethod: req.FormValue("method"),
+		},
+		Logger: util.GetLogger(req.Context()),
 	}
 	width, err := strconv.Atoi(req.FormValue("width"))
 	if err != nil {
@@ -129,8 +69,8 @@ func Thumbnail(w http.ResponseWriter, req *http.Request, origin gomatrixserverli
 	if err != nil {
 		height = -1
 	}
-	r.Width = width
-	r.Height = height
+	r.ThumbnailSize.Width = width
+	r.ThumbnailSize.Height = height
 
 	// request validation
 	if req.Method != "GET" {
@@ -184,17 +124,17 @@ func (r *thumbnailRequest) Validate() *util.JSONResponse {
 			JSON: jsonerror.NotFound("serverName must be a non-empty string"),
 		}
 	}
-	if r.Width <= 0 || r.Height <= 0 {
+	if r.ThumbnailSize.Width <= 0 || r.ThumbnailSize.Height <= 0 {
 		return &util.JSONResponse{
 			Code: 400,
 			JSON: jsonerror.Unknown("width and height must be greater than 0"),
 		}
 	}
 	// Default method to scale if not set
-	if r.ResizeMethod == "" {
-		r.ResizeMethod = "scale"
+	if r.ThumbnailSize.ResizeMethod == "" {
+		r.ThumbnailSize.ResizeMethod = "scale"
 	}
-	if r.ResizeMethod != "crop" && r.ResizeMethod != "scale" {
+	if r.ThumbnailSize.ResizeMethod != "crop" && r.ThumbnailSize.ResizeMethod != "scale" {
 		return &util.JSONResponse{
 			Code: 400,
 			JSON: jsonerror.Unknown("method must be one of crop or scale"),
@@ -306,24 +246,24 @@ func (r *thumbnailRequest) respondFromLocalFile(w http.ResponseWriter, absBasePa
 	r.Logger.WithFields(log.Fields{
 		"MediaID":      r.MediaMetadata.MediaID,
 		"Origin":       r.MediaMetadata.Origin,
-		"Width":        r.Width,
-		"Height":       r.Height,
-		"ResizeMethod": r.ResizeMethod,
+		"Width":        r.ThumbnailSize.Width,
+		"Height":       r.ThumbnailSize.Height,
+		"ResizeMethod": r.ThumbnailSize.ResizeMethod,
 	}).Info("Creating thumbnail")
-	thumbPath := fmt.Sprintf("%s_thumb-%vx%v", filePath, r.Width, r.Height)
-	if err = resize(types.Path(thumbPath), types.Path(filePath), r.Width, r.Height, r.ResizeMethod == "crop", r.Logger); err != nil {
+	if err = thumbnailer.GenerateThumbnail(types.Path(filePath), r.ThumbnailSize, r.Logger); err != nil {
 		r.Logger.WithError(err).WithFields(log.Fields{
 			"MediaID":      r.MediaMetadata.MediaID,
 			"Origin":       r.MediaMetadata.Origin,
-			"Width":        r.Width,
-			"Height":       r.Height,
-			"ResizeMethod": r.ResizeMethod,
+			"Width":        r.ThumbnailSize.Width,
+			"Height":       r.ThumbnailSize.Height,
+			"ResizeMethod": r.ThumbnailSize.ResizeMethod,
 		}).Error("Error creating thumbnail")
 		resErr := jsonerror.InternalServerError()
 		return &resErr
 	}
-	thumbFile, err := os.Open(thumbPath)
-	// FIXME: defer os.Close(thumbPath) ?
+	thumbPath := thumbnailer.GetThumbnailPath(types.Path(filePath), r.ThumbnailSize)
+	thumbFile, err := os.Open(string(thumbPath))
+	// FIXME: defer os.Close(string(thumbPath)) ?
 	if err != nil {
 		// FIXME: Remove erroneous thumbFile from database?
 		r.Logger.WithError(err).Warn("Failed to open thumbFile")
@@ -341,9 +281,9 @@ func (r *thumbnailRequest) respondFromLocalFile(w http.ResponseWriter, absBasePa
 	r.Logger.WithFields(log.Fields{
 		"MediaID":       r.MediaMetadata.MediaID,
 		"Origin":        r.MediaMetadata.Origin,
-		"Width":         r.Width,
-		"Height":        r.Height,
-		"ResizeMethod":  r.ResizeMethod,
+		"Width":         r.ThumbnailSize.Width,
+		"Height":        r.ThumbnailSize.Height,
+		"ResizeMethod":  r.ThumbnailSize.ResizeMethod,
 		"FileSizeBytes": thumbStat.Size(),
 		"Content-Type":  "image/jpeg",
 	}).Info("Responding with thumbnail")
@@ -410,7 +350,7 @@ func (r *thumbnailRequest) respondFromRemoteFile(w http.ResponseWriter, cfg *con
 	} else {
 		// If we have a record, we can respond from the local file
 		// FIXME: NOTE LOCKING
-		if resErr := r.getRemoteFile(cfg.AbsBasePath, cfg.MaxFileSizeBytes, db, activeRemoteRequests); resErr != nil {
+		if resErr := r.getRemoteFile(cfg.AbsBasePath, *cfg.MaxFileSizeBytes, db, activeRemoteRequests); resErr != nil {
 			return resErr
 		}
 	}
@@ -526,7 +466,7 @@ func (r *thumbnailRequest) getRemoteFile(absBasePath types.Path, maxFileSizeByte
 		// there is valid metadata in the database for that file. As such we only
 		// remove the file if it is not a duplicate.
 		if duplicate == false {
-			finalDir := path.Dir(string(finalPath))
+			finalDir := filepath.Dir(string(finalPath))
 			fileutils.RemoveDir(types.Path(finalDir), r.Logger)
 		}
 		// NOTE: It should really not be possible to fail the uniqueness test here so
@@ -581,6 +521,7 @@ func (r *thumbnailRequest) fetchRemoteFile(absBasePath types.Path, maxFileSizeBy
 	// The file data is hashed but is NOT used as the MediaID, unlike in Upload. The hash is useful as a
 	// method of deduplicating files to save storage, as well as a way to conduct
 	// integrity checks on the file data in the repository.
+	// Data is truncated to maxFileSizeBytes. Content-Length was reported as 0 < Content-Length <= maxFileSizeBytes so this is OK.
 	hash, bytesWritten, tmpDir, err := fileutils.WriteTempFile(resp.Body, maxFileSizeBytes, absBasePath)
 	if err != nil {
 		r.Logger.WithError(err).WithFields(log.Fields{
@@ -591,7 +532,7 @@ func (r *thumbnailRequest) fetchRemoteFile(absBasePath types.Path, maxFileSizeBy
 		fileutils.RemoveDir(tmpDir, r.Logger)
 		return "", false, &util.JSONResponse{
 			Code: 502,
-			JSON: jsonerror.Unknown(fmt.Sprintf("File could not be thumbnailed from remote server")),
+			JSON: jsonerror.Unknown("File could not be thumbnailed from remote server"),
 		}
 	}
 

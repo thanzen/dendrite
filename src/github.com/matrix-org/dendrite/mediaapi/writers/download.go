@@ -23,7 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -289,7 +289,7 @@ func (r *downloadRequest) respondFromRemoteFile(w http.ResponseWriter, cfg *conf
 	} else {
 		// If we have a record, we can respond from the local file
 		// FIXME: NOTE LOCKING
-		if resErr := r.getRemoteFile(cfg.AbsBasePath, cfg.MaxFileSizeBytes, db, activeRemoteRequests); resErr != nil {
+		if resErr := r.getRemoteFile(cfg.AbsBasePath, *cfg.MaxFileSizeBytes, db, activeRemoteRequests); resErr != nil {
 			return resErr
 		}
 	}
@@ -405,7 +405,7 @@ func (r *downloadRequest) getRemoteFile(absBasePath types.Path, maxFileSizeBytes
 		// there is valid metadata in the database for that file. As such we only
 		// remove the file if it is not a duplicate.
 		if duplicate == false {
-			finalDir := path.Dir(string(finalPath))
+			finalDir := filepath.Dir(string(finalPath))
 			fileutils.RemoveDir(types.Path(finalDir), r.Logger)
 		}
 		// NOTE: It should really not be possible to fail the uniqueness test here so
@@ -448,6 +448,12 @@ func (r *downloadRequest) fetchRemoteFile(absBasePath types.Path, maxFileSizeByt
 	if err != nil {
 		r.Logger.WithError(err).Warn("Failed to parse content length")
 	}
+	if contentLength > int64(maxFileSizeBytes) {
+		return "", false, &util.JSONResponse{
+			Code: 413,
+			JSON: jsonerror.Unknown(fmt.Sprintf("Remote file is too large (%v > %v bytes)", contentLength, maxFileSizeBytes)),
+		}
+	}
 	r.MediaMetadata.FileSizeBytes = types.FileSizeBytes(contentLength)
 	r.MediaMetadata.ContentType = types.ContentType(resp.Header.Get("Content-Type"))
 	r.MediaMetadata.UploadName = types.Filename(contentDispositionToFilename(resp.Header.Get("Content-Disposition")))
@@ -460,6 +466,7 @@ func (r *downloadRequest) fetchRemoteFile(absBasePath types.Path, maxFileSizeByt
 	// The file data is hashed but is NOT used as the MediaID, unlike in Upload. The hash is useful as a
 	// method of deduplicating files to save storage, as well as a way to conduct
 	// integrity checks on the file data in the repository.
+	// Data is truncated to maxFileSizeBytes. Content-Length was reported as 0 < Content-Length <= maxFileSizeBytes so this is OK.
 	hash, bytesWritten, tmpDir, err := fileutils.WriteTempFile(resp.Body, maxFileSizeBytes, absBasePath)
 	if err != nil {
 		r.Logger.WithError(err).WithFields(log.Fields{
@@ -470,7 +477,7 @@ func (r *downloadRequest) fetchRemoteFile(absBasePath types.Path, maxFileSizeByt
 		fileutils.RemoveDir(tmpDir, r.Logger)
 		return "", false, &util.JSONResponse{
 			Code: 502,
-			JSON: jsonerror.Unknown(fmt.Sprintf("File could not be downloaded from remote server")),
+			JSON: jsonerror.Unknown("File could not be downloaded from remote server"),
 		}
 	}
 
