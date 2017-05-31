@@ -231,6 +231,7 @@ func (r *downloadRequest) respondFromLocalFile(w http.ResponseWriter, absBasePat
 		}
 	}
 	file, err := os.Open(filePath)
+	// FIXME: defer file.Close() ?
 	if err != nil {
 		// FIXME: Remove erroneous file from database?
 		r.Logger.WithError(err).Warn("Failed to open file")
@@ -239,7 +240,6 @@ func (r *downloadRequest) respondFromLocalFile(w http.ResponseWriter, absBasePat
 			JSON: jsonerror.NotFound(fmt.Sprintf("File with media ID %q does not exist", r.MediaMetadata.MediaID)),
 		}
 	}
-
 	stat, err := file.Stat()
 	if err != nil {
 		// FIXME: Remove erroneous file from database?
