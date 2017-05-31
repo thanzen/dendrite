@@ -103,8 +103,6 @@ func createThumbnail(src types.Path, buffer []byte, config types.ThumbnailSize, 
 // If the source aspect ratio is different to the target dimensions, one edge will be smaller than requested
 // If crop is set to true, the image will be scaled to fill the width and height with any excess being cropped off
 func resize(dst types.Path, buffer []byte, w, h int, crop bool, logger *log.Entry) error {
-	cp := make([]byte, len(buffer), cap(buffer))
-	copy(cp, buffer)
 	inImage := bimg.NewImage(buffer)
 
 	inSize, err := inImage.Size()
@@ -142,15 +140,6 @@ func resize(dst types.Path, buffer []byte, w, h int, crop bool, logger *log.Entr
 
 	if err = bimg.Write(string(dst), newImage); err != nil {
 		logger.WithError(err).Error("Failed to resize image")
-	}
-
-	if len(buffer) != len(cp) {
-		logger.Panic("lengths differ!")
-	}
-	for i := 0; i < len(cp); i++ {
-		if buffer[i] != cp[i] {
-			logger.Panicf("buffer[%v] != cp[%v]", i, i)
-		}
 	}
 
 	return err
