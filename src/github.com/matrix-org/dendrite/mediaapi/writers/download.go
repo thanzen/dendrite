@@ -231,8 +231,6 @@ func (r *downloadRequest) respondFromLocalFile(w http.ResponseWriter, absBasePat
 		r.MediaMetadata.ContentType = types.ContentType("image/jpeg")
 
 		r.Logger.WithFields(log.Fields{
-			"MediaID":       r.MediaMetadata.MediaID,
-			"Origin":        r.MediaMetadata.Origin,
 			"Width":         r.ThumbnailSize.Width,
 			"Height":        r.ThumbnailSize.Height,
 			"ResizeMethod":  r.ThumbnailSize.ResizeMethod,
@@ -243,8 +241,6 @@ func (r *downloadRequest) respondFromLocalFile(w http.ResponseWriter, absBasePat
 		responseFile = thumbFile
 	} else {
 		r.Logger.WithFields(log.Fields{
-			"MediaID":       r.MediaMetadata.MediaID,
-			"Origin":        r.MediaMetadata.Origin,
 			"UploadName":    r.MediaMetadata.UploadName,
 			"Base64Hash":    r.MediaMetadata.Base64Hash,
 			"FileSizeBytes": r.MediaMetadata.FileSizeBytes,
@@ -280,8 +276,6 @@ func (r *downloadRequest) getThumbnailFile(filePath types.Path, dynamicThumbnail
 	if dynamicThumbnails {
 		if err := thumbnailer.GenerateThumbnail(types.Path(filePath), r.ThumbnailSize, r.Logger); err != nil {
 			r.Logger.WithError(err).WithFields(log.Fields{
-				"MediaID":      r.MediaMetadata.MediaID,
-				"Origin":       r.MediaMetadata.Origin,
 				"Width":        r.ThumbnailSize.Width,
 				"Height":       r.ThumbnailSize.Height,
 				"ResizeMethod": r.ThumbnailSize.ResizeMethod,
@@ -350,10 +344,7 @@ func (r *downloadRequest) getMediaMetadataForRemoteFile(db *storage.Database, ac
 	// Check if there is an active remote request for the file
 	mxcURL := "mxc://" + string(r.MediaMetadata.Origin) + "/" + string(r.MediaMetadata.MediaID)
 	if activeRemoteRequestCondition, ok := activeRemoteRequests.MXCToCond[mxcURL]; ok {
-		r.Logger.WithFields(log.Fields{
-			"Origin":  r.MediaMetadata.Origin,
-			"MediaID": r.MediaMetadata.MediaID,
-		}).Info("Waiting for another goroutine to fetch the remote file.")
+		r.Logger.Info("Waiting for another goroutine to fetch the remote file.")
 
 		activeRemoteRequestCondition.Wait()
 		activeRemoteRequests.Unlock()
@@ -373,10 +364,7 @@ func (r *downloadRequest) getMediaMetadataForRemoteFile(db *storage.Database, ac
 			return mediaMetadata, nil
 		}
 
-		r.Logger.WithFields(log.Fields{
-			"Origin":  r.MediaMetadata.Origin,
-			"MediaID": r.MediaMetadata.MediaID,
-		}).Error("Other goroutine failed to fetch the remote file.")
+		r.Logger.Error("Other goroutine failed to fetch the remote file.")
 
 		return nil, &util.JSONResponse{
 			Code: 404,
@@ -402,10 +390,7 @@ func (r *downloadRequest) getRemoteFile(absBasePath types.Path, maxFileSizeBytes
 		defer activeRemoteRequests.Unlock()
 		mxcURL := "mxc://" + string(r.MediaMetadata.Origin) + "/" + string(r.MediaMetadata.MediaID)
 		if activeRemoteRequestCondition, ok := activeRemoteRequests.MXCToCond[mxcURL]; ok {
-			r.Logger.WithFields(log.Fields{
-				"Origin":  r.MediaMetadata.Origin,
-				"MediaID": r.MediaMetadata.MediaID,
-			}).Info("Signalling other goroutines waiting for this goroutine to fetch the file.")
+			r.Logger.Info("Signalling other goroutines waiting for this goroutine to fetch the file.")
 			activeRemoteRequestCondition.Broadcast()
 		}
 		delete(activeRemoteRequests.MXCToCond, mxcURL)
@@ -428,8 +413,6 @@ func (r *downloadRequest) getRemoteFile(absBasePath types.Path, maxFileSizeBytes
 	isError = false
 
 	r.Logger.WithFields(log.Fields{
-		"MediaID":       r.MediaMetadata.MediaID,
-		"Origin":        r.MediaMetadata.Origin,
 		"Base64Hash":    r.MediaMetadata.Base64Hash,
 		"UploadName":    r.MediaMetadata.UploadName,
 		"FileSizeBytes": r.MediaMetadata.FileSizeBytes,
@@ -454,8 +437,6 @@ func (r *downloadRequest) getRemoteFile(absBasePath types.Path, maxFileSizeBytes
 	go thumbnailer.GenerateThumbnails(finalPath, thumbnailSizes, r.Logger)
 
 	r.Logger.WithFields(log.Fields{
-		"MediaID":       r.MediaMetadata.MediaID,
-		"Origin":        r.MediaMetadata.Origin,
 		"UploadName":    r.MediaMetadata.UploadName,
 		"Base64Hash":    r.MediaMetadata.Base64Hash,
 		"FileSizeBytes": r.MediaMetadata.FileSizeBytes,
@@ -466,10 +447,7 @@ func (r *downloadRequest) getRemoteFile(absBasePath types.Path, maxFileSizeBytes
 }
 
 func (r *downloadRequest) fetchRemoteFile(absBasePath types.Path, maxFileSizeBytes types.FileSizeBytes) (types.Path, bool, *util.JSONResponse) {
-	r.Logger.WithFields(log.Fields{
-		"Origin":  r.MediaMetadata.Origin,
-		"MediaID": r.MediaMetadata.MediaID,
-	}).Info("Fetching remote file")
+	r.Logger.Info("Fetching remote file")
 
 	// create request for remote file
 	resp, resErr := r.createRemoteRequest()
@@ -493,10 +471,7 @@ func (r *downloadRequest) fetchRemoteFile(absBasePath types.Path, maxFileSizeByt
 	r.MediaMetadata.ContentType = types.ContentType(resp.Header.Get("Content-Type"))
 	r.MediaMetadata.UploadName = types.Filename(contentDispositionToFilename(resp.Header.Get("Content-Disposition")))
 
-	r.Logger.WithFields(log.Fields{
-		"MediaID": r.MediaMetadata.MediaID,
-		"Origin":  r.MediaMetadata.Origin,
-	}).Info("Transferring remote file")
+	r.Logger.Info("Transferring remote file")
 
 	// The file data is hashed but is NOT used as the MediaID, unlike in Upload. The hash is useful as a
 	// method of deduplicating files to save storage, as well as a way to conduct
@@ -505,8 +480,6 @@ func (r *downloadRequest) fetchRemoteFile(absBasePath types.Path, maxFileSizeByt
 	hash, bytesWritten, tmpDir, err := fileutils.WriteTempFile(resp.Body, maxFileSizeBytes, absBasePath)
 	if err != nil {
 		r.Logger.WithError(err).WithFields(log.Fields{
-			"MediaID":          r.MediaMetadata.MediaID,
-			"Origin":           r.MediaMetadata.Origin,
 			"MaxFileSizeBytes": maxFileSizeBytes,
 		}).Warn("Error while downloading file from remote server")
 		fileutils.RemoveDir(tmpDir, r.Logger)
@@ -516,10 +489,7 @@ func (r *downloadRequest) fetchRemoteFile(absBasePath types.Path, maxFileSizeByt
 		}
 	}
 
-	r.Logger.WithFields(log.Fields{
-		"MediaID": r.MediaMetadata.MediaID,
-		"Origin":  r.MediaMetadata.Origin,
-	}).Info("Remote file transferred")
+	r.Logger.Info("Remote file transferred")
 
 	// It's possible the bytesWritten to the temporary file is different to the reported Content-Length from the remote
 	// request's response. bytesWritten is therefore used as it is what would be sent to clients when reading from the local
@@ -580,22 +550,15 @@ func (r *downloadRequest) createRemoteRequest() (*http.Response, *util.JSONRespo
 	}
 
 	if resp.StatusCode != 200 {
-		r.Logger.WithFields(log.Fields{
-			"Origin":     r.MediaMetadata.Origin,
-			"MediaID":    r.MediaMetadata.MediaID,
-			"StatusCode": resp.StatusCode,
-		}).Info("Received error response")
 		if resp.StatusCode == 404 {
-			r.Logger.WithFields(log.Fields{
-				"Origin":     r.MediaMetadata.Origin,
-				"MediaID":    r.MediaMetadata.MediaID,
-				"StatusCode": resp.StatusCode,
-			}).Warn("Remote server says file does not exist")
 			return nil, &util.JSONResponse{
 				Code: 404,
 				JSON: jsonerror.NotFound(fmt.Sprintf("File with media ID %q does not exist", r.MediaMetadata.MediaID)),
 			}
 		}
+		r.Logger.WithFields(log.Fields{
+			"StatusCode": resp.StatusCode,
+		}).Info("Received error response")
 		return nil, &util.JSONResponse{
 			Code: 502,
 			JSON: jsonerror.Unknown(fmt.Sprintf("File with media ID %q could not be downloaded from %q", r.MediaMetadata.MediaID, r.MediaMetadata.Origin)),
