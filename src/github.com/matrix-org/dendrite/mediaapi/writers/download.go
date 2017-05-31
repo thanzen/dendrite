@@ -343,10 +343,10 @@ func (r *downloadRequest) getMediaMetadataForRemoteFile(db *storage.Database, ac
 
 	// Check if there is an active remote request for the file
 	mxcURL := "mxc://" + string(r.MediaMetadata.Origin) + "/" + string(r.MediaMetadata.MediaID)
-	if activeRemoteRequestCondition, ok := activeRemoteRequests.MXCToCond[mxcURL]; ok {
+	if activeRemoteRequestResult, ok := activeRemoteRequests.MXCToResult[mxcURL]; ok {
 		r.Logger.Info("Waiting for another goroutine to fetch the remote file.")
 
-		activeRemoteRequestCondition.Wait()
+		activeRemoteRequestResult.Cond.Wait()
 		activeRemoteRequests.Unlock()
 		// NOTE: there is still a deferred Unlock() that will unlock this
 		activeRemoteRequests.Lock()
@@ -364,24 +364,39 @@ func (r *downloadRequest) getMediaMetadataForRemoteFile(db *storage.Database, ac
 			return mediaMetadata, nil
 		}
 
-		r.Logger.Error("Other goroutine failed to fetch the remote file.")
-
-		return nil, &util.JSONResponse{
-			Code: 404,
-			JSON: jsonerror.NotFound("File not found."),
+		// Note: if the result was 200, we shouldn't get here
+		switch activeRemoteRequestResult.Result {
+		case 404:
+			return nil, &util.JSONResponse{
+				Code: 404,
+				JSON: jsonerror.NotFound("File not found."),
+			}
+		case 500:
+			r.Logger.Error("Other goroutine failed to fetch the remote file.")
+			resErr := jsonerror.InternalServerError()
+			return nil, &resErr
+		default:
+			r.Logger.Error("Other goroutine failed to fetch the remote file.")
+			return nil, &util.JSONResponse{
+				Code: activeRemoteRequestResult.Result,
+				JSON: jsonerror.Unknown("Failed to fetch file from remote server."),
+			}
 		}
 	}
 
 	// No active remote request so create one
-	activeRemoteRequests.MXCToCond[mxcURL] = &sync.Cond{L: activeRemoteRequests}
+	activeRemoteRequests.MXCToResult[mxcURL] = &types.RemoteRequestResult{
+		Cond: &sync.Cond{L: activeRemoteRequests},
+	}
 	return nil, nil
 }
 
 // getRemoteFile fetches the file from the remote server and stores its metadata in the database
-// Only the owner of the activeRemoteRequestCondition for this origin and media ID should call this function.
+// Only the owner of the activeRemoteRequestResult for this origin and media ID should call this function.
 func (r *downloadRequest) getRemoteFile(absBasePath types.Path, maxFileSizeBytes types.FileSizeBytes, thumbnailSizes []types.ThumbnailSize, db *storage.Database, activeRemoteRequests *types.ActiveRemoteRequests) *util.JSONResponse {
 	// Wake up other goroutines after this function returns.
 	isError := true
+	var result int
 	defer func() {
 		if isError {
 			// If an error happens, the lock MUST NOT have been taken, isError MUST be true and so the lock is taken here.
@@ -389,15 +404,21 @@ func (r *downloadRequest) getRemoteFile(absBasePath types.Path, maxFileSizeBytes
 		}
 		defer activeRemoteRequests.Unlock()
 		mxcURL := "mxc://" + string(r.MediaMetadata.Origin) + "/" + string(r.MediaMetadata.MediaID)
-		if activeRemoteRequestCondition, ok := activeRemoteRequests.MXCToCond[mxcURL]; ok {
+		if activeRemoteRequestResult, ok := activeRemoteRequests.MXCToResult[mxcURL]; ok {
 			r.Logger.Info("Signalling other goroutines waiting for this goroutine to fetch the file.")
-			activeRemoteRequestCondition.Broadcast()
+			if result == 0 {
+				r.Logger.Error("Invalid result, treating as InternalServerError")
+				result = 500
+			}
+			activeRemoteRequestResult.Result = result
+			activeRemoteRequestResult.Cond.Broadcast()
 		}
-		delete(activeRemoteRequests.MXCToCond, mxcURL)
+		delete(activeRemoteRequests.MXCToResult, mxcURL)
 	}()
 
 	finalPath, duplicate, resErr := r.fetchRemoteFile(absBasePath, maxFileSizeBytes)
 	if resErr != nil {
+		result = resErr.Code
 		return resErr
 	}
 
@@ -431,6 +452,7 @@ func (r *downloadRequest) getRemoteFile(absBasePath types.Path, maxFileSizeBytes
 		// NOTE: It should really not be possible to fail the uniqueness test here so
 		// there is no need to handle that separately
 		resErr := jsonerror.InternalServerError()
+		result = resErr.Code
 		return &resErr
 	}
 
@@ -443,6 +465,7 @@ func (r *downloadRequest) getRemoteFile(absBasePath types.Path, maxFileSizeBytes
 		"Content-Type":  r.MediaMetadata.ContentType,
 	}).Infof("Remote file cached")
 
+	result = 200
 	return nil
 }
 
@@ -460,6 +483,10 @@ func (r *downloadRequest) fetchRemoteFile(absBasePath types.Path, maxFileSizeByt
 	contentLength, err := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
 	if err != nil {
 		r.Logger.WithError(err).Warn("Failed to parse content length")
+		return "", false, &util.JSONResponse{
+			Code: 502,
+			JSON: jsonerror.Unknown("Invalid response from remote server"),
+		}
 	}
 	if contentLength > int64(maxFileSizeBytes) {
 		return "", false, &util.JSONResponse{
