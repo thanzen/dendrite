@@ -45,32 +45,26 @@ func Setup(servMux *http.ServeMux, httpClient *http.Client, cfg *config.MediaAPI
 		MXCToCond: map[string]*sync.Cond{},
 	}
 	r0mux.Handle("/download/{serverName}/{mediaId}",
-		prometheus.InstrumentHandler("download", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			req = util.RequestWithLogging(req)
-
-			// Set common headers returned regardless of the outcome of the request
-			util.SetCORSHeaders(w)
-			// Content-Type will be overridden in case of returning file data, else we respond with JSON-formatted errors
-			w.Header().Set("Content-Type", "application/json")
-
-			vars := mux.Vars(req)
-			writers.Download(w, req, gomatrixserverlib.ServerName(vars["serverName"]), types.MediaID(vars["mediaId"]), cfg, db, activeRemoteRequests)
-		})),
+		makeDownloadAPI("download", cfg, db, activeRemoteRequests),
 	)
 	r0mux.Handle("/thumbnail/{serverName}/{mediaId}",
-		prometheus.InstrumentHandler("thumbnail", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			req = util.RequestWithLogging(req)
-
-			// Set common headers returned regardless of the outcome of the request
-			util.SetCORSHeaders(w)
-			// Content-Type will be overridden in case of returning file data, else we respond with JSON-formatted errors
-			w.Header().Set("Content-Type", "application/json")
-
-			vars := mux.Vars(req)
-			writers.Thumbnail(w, req, gomatrixserverlib.ServerName(vars["serverName"]), types.MediaID(vars["mediaId"]), cfg, db, activeRemoteRequests)
-		})),
+		makeDownloadAPI("thumbnail", cfg, db, activeRemoteRequests),
 	)
 
 	servMux.Handle("/metrics", prometheus.Handler())
 	servMux.Handle("/api/", http.StripPrefix("/api", apiMux))
+}
+
+func makeDownloadAPI(name string, cfg *config.MediaAPI, db *storage.Database, activeRemoteRequests *types.ActiveRemoteRequests) http.HandlerFunc {
+	return prometheus.InstrumentHandler(name, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		req = util.RequestWithLogging(req)
+
+		// Set common headers returned regardless of the outcome of the request
+		util.SetCORSHeaders(w)
+		// Content-Type will be overridden in case of returning file data, else we respond with JSON-formatted errors
+		w.Header().Set("Content-Type", "application/json")
+
+		vars := mux.Vars(req)
+		writers.Download(w, req, gomatrixserverlib.ServerName(vars["serverName"]), types.MediaID(vars["mediaId"]), cfg, db, activeRemoteRequests, name == "thumbnail")
+	}))
 }

@@ -34,6 +34,7 @@ import (
 	"github.com/matrix-org/dendrite/mediaapi/config"
 	"github.com/matrix-org/dendrite/mediaapi/fileutils"
 	"github.com/matrix-org/dendrite/mediaapi/storage"
+	"github.com/matrix-org/dendrite/mediaapi/thumbnailer"
 	"github.com/matrix-org/dendrite/mediaapi/types"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/util"
@@ -51,26 +52,46 @@ var (
 	errDBNotFound = fmt.Errorf("media not found")
 )
 
-// downloadRequest metadata included in or derivable from an download request
+// downloadRequest metadata included in or derivable from a download or thumbnail request
 // https://matrix.org/docs/spec/client_server/r0.2.0.html#get-matrix-media-r0-download-servername-mediaid
+// http://matrix.org/docs/spec/client_server/r0.2.0.html#get-matrix-media-r0-thumbnail-servername-mediaid
 type downloadRequest struct {
-	MediaMetadata *types.MediaMetadata
-	Logger        *log.Entry
+	MediaMetadata      *types.MediaMetadata
+	IsThumbnailRequest bool
+	ThumbnailSize      types.ThumbnailSize
+	Logger             *log.Entry
 }
 
-// Download implements /download
+// Download implements /download amd /thumbnail
 // Files from this server (i.e. origin == cfg.ServerName) are served directly
 // Files from remote servers (i.e. origin != cfg.ServerName) are cached locally.
 // If they are present in the cache, they are served directly.
 // If they are not present in the cache, they are obtained from the remote server and
 // simultaneously served back to the client and written into the cache.
-func Download(w http.ResponseWriter, req *http.Request, origin gomatrixserverlib.ServerName, mediaID types.MediaID, cfg *config.MediaAPI, db *storage.Database, activeRemoteRequests *types.ActiveRemoteRequests) {
+func Download(w http.ResponseWriter, req *http.Request, origin gomatrixserverlib.ServerName, mediaID types.MediaID, cfg *config.MediaAPI, db *storage.Database, activeRemoteRequests *types.ActiveRemoteRequests, isThumbnailRequest bool) {
 	r := &downloadRequest{
 		MediaMetadata: &types.MediaMetadata{
 			MediaID: mediaID,
 			Origin:  origin,
 		},
-		Logger: util.GetLogger(req.Context()),
+		IsThumbnailRequest: isThumbnailRequest,
+		Logger:             util.GetLogger(req.Context()),
+	}
+
+	if r.IsThumbnailRequest {
+		width, err := strconv.Atoi(req.FormValue("width"))
+		if err != nil {
+			width = -1
+		}
+		height, err := strconv.Atoi(req.FormValue("height"))
+		if err != nil {
+			height = -1
+		}
+		r.ThumbnailSize = types.ThumbnailSize{
+			Width:        width,
+			Height:       height,
+			ResizeMethod: req.FormValue("method"),
+		}
 	}
 
 	// request validation
@@ -125,6 +146,25 @@ func (r *downloadRequest) Validate() *util.JSONResponse {
 			JSON: jsonerror.NotFound("serverName must be a non-empty string"),
 		}
 	}
+
+	if r.IsThumbnailRequest {
+		if r.ThumbnailSize.Width <= 0 || r.ThumbnailSize.Height <= 0 {
+			return &util.JSONResponse{
+				Code: 400,
+				JSON: jsonerror.Unknown("width and height must be greater than 0"),
+			}
+		}
+		// Default method to scale if not set
+		if r.ThumbnailSize.ResizeMethod == "" {
+			r.ThumbnailSize.ResizeMethod = "scale"
+		}
+		if r.ThumbnailSize.ResizeMethod != "crop" && r.ThumbnailSize.ResizeMethod != "scale" {
+			return &util.JSONResponse{
+				Code: 400,
+				JSON: jsonerror.Unknown("method must be one of crop or scale"),
+			}
+		}
+	}
 	return nil
 }
 
@@ -134,7 +174,7 @@ func (r *downloadRequest) doDownload(w http.ResponseWriter, cfg *config.MediaAPI
 	if err == nil {
 		// If we have a record, we can respond from the local file
 		r.MediaMetadata = mediaMetadata
-		return r.respondFromLocalFile(w, cfg.AbsBasePath)
+		return r.respondFromLocalFile(w, cfg.AbsBasePath, cfg.DynamicThumbnails)
 	} else if err == errDBNotFound {
 		if r.MediaMetadata.Origin == cfg.ServerName {
 			// If we do not have a record and the origin is local, the file is not found
@@ -180,16 +220,7 @@ func (r *downloadRequest) getMediaMetadata(db *storage.Database) (*types.MediaMe
 
 // respondFromLocalFile reads a file from local storage and writes it to the http.ResponseWriter
 // Returns a util.JSONResponse error in case of error
-func (r *downloadRequest) respondFromLocalFile(w http.ResponseWriter, absBasePath types.Path) *util.JSONResponse {
-	r.Logger.WithFields(log.Fields{
-		"MediaID":       r.MediaMetadata.MediaID,
-		"Origin":        r.MediaMetadata.Origin,
-		"UploadName":    r.MediaMetadata.UploadName,
-		"Base64Hash":    r.MediaMetadata.Base64Hash,
-		"FileSizeBytes": r.MediaMetadata.FileSizeBytes,
-		"Content-Type":  r.MediaMetadata.ContentType,
-	}).Info("Responding with file")
-
+func (r *downloadRequest) respondFromLocalFile(w http.ResponseWriter, absBasePath types.Path, dynamicThumbnails bool) *util.JSONResponse {
 	filePath, err := fileutils.GetPathFromBase64Hash(r.MediaMetadata.Base64Hash, absBasePath)
 	if err != nil {
 		// FIXME: Remove erroneous file from database?
@@ -227,6 +258,40 @@ func (r *downloadRequest) respondFromLocalFile(w http.ResponseWriter, absBasePat
 		// FIXME: Remove erroneous file from database?
 	}
 
+	var responseFile *os.File
+	if r.IsThumbnailRequest {
+		thumbFile, thumbSize, resErr := r.getThumbnailFile(types.Path(filePath), dynamicThumbnails)
+		// FIXME: defer thumbFile.Close() ?
+		if resErr != nil {
+			return resErr
+		}
+
+		r.MediaMetadata.FileSizeBytes = thumbSize
+		r.MediaMetadata.ContentType = types.ContentType("image/jpeg")
+
+		r.Logger.WithFields(log.Fields{
+			"MediaID":       r.MediaMetadata.MediaID,
+			"Origin":        r.MediaMetadata.Origin,
+			"Width":         r.ThumbnailSize.Width,
+			"Height":        r.ThumbnailSize.Height,
+			"ResizeMethod":  r.ThumbnailSize.ResizeMethod,
+			"Base64Hash":    r.MediaMetadata.Base64Hash,
+			"FileSizeBytes": r.MediaMetadata.FileSizeBytes,
+			"Content-Type":  r.MediaMetadata.ContentType,
+		}).Info("Responding with thumbnail")
+		responseFile = thumbFile
+	} else {
+		r.Logger.WithFields(log.Fields{
+			"MediaID":       r.MediaMetadata.MediaID,
+			"Origin":        r.MediaMetadata.Origin,
+			"UploadName":    r.MediaMetadata.UploadName,
+			"Base64Hash":    r.MediaMetadata.Base64Hash,
+			"FileSizeBytes": r.MediaMetadata.FileSizeBytes,
+			"Content-Type":  r.MediaMetadata.ContentType,
+		}).Info("Responding with file")
+		responseFile = file
+	}
+
 	w.Header().Set("Content-Type", string(r.MediaMetadata.ContentType))
 	w.Header().Set("Content-Length", strconv.FormatInt(int64(r.MediaMetadata.FileSizeBytes), 10))
 	contentSecurityPolicy := "default-src 'none';" +
@@ -236,7 +301,7 @@ func (r *downloadRequest) respondFromLocalFile(w http.ResponseWriter, absBasePat
 		" object-src 'self';"
 	w.Header().Set("Content-Security-Policy", contentSecurityPolicy)
 
-	if bytesResponded, err := io.Copy(w, file); err != nil {
+	if bytesResponded, err := io.Copy(w, responseFile); err != nil {
 		r.Logger.WithError(err).Warn("Failed to copy from cache")
 		if bytesResponded == 0 {
 			return &util.JSONResponse{
@@ -249,6 +314,36 @@ func (r *downloadRequest) respondFromLocalFile(w http.ResponseWriter, absBasePat
 		r.closeConnection(w)
 	}
 	return nil
+}
+
+func (r *downloadRequest) getThumbnailFile(filePath types.Path, dynamicThumbnails bool) (*os.File, types.FileSizeBytes, *util.JSONResponse) {
+	if dynamicThumbnails {
+		if err := thumbnailer.GenerateThumbnail(types.Path(filePath), r.ThumbnailSize, r.Logger); err != nil {
+			r.Logger.WithError(err).WithFields(log.Fields{
+				"MediaID":      r.MediaMetadata.MediaID,
+				"Origin":       r.MediaMetadata.Origin,
+				"Width":        r.ThumbnailSize.Width,
+				"Height":       r.ThumbnailSize.Height,
+				"ResizeMethod": r.ThumbnailSize.ResizeMethod,
+			}).Error("Error creating thumbnail")
+			resErr := jsonerror.InternalServerError()
+			return nil, -1, &resErr
+		}
+	}
+	thumbPath := string(thumbnailer.GetThumbnailPath(types.Path(filePath), r.ThumbnailSize))
+	thumbFile, err := os.Open(string(thumbPath))
+	if err != nil {
+		r.Logger.WithError(err).Warn("Failed to open file")
+		resErr := jsonerror.InternalServerError()
+		return nil, -1, &resErr
+	}
+	thumbStat, err := thumbFile.Stat()
+	if err != nil {
+		r.Logger.WithError(err).Warn("Failed to stat file")
+		resErr := jsonerror.InternalServerError()
+		return nil, -1, &resErr
+	}
+	return thumbFile, types.FileSizeBytes(thumbStat.Size()), nil
 }
 
 func (r *downloadRequest) closeConnection(w http.ResponseWriter) {
@@ -289,11 +384,11 @@ func (r *downloadRequest) respondFromRemoteFile(w http.ResponseWriter, cfg *conf
 	} else {
 		// If we have a record, we can respond from the local file
 		// FIXME: NOTE LOCKING
-		if resErr := r.getRemoteFile(cfg.AbsBasePath, *cfg.MaxFileSizeBytes, db, activeRemoteRequests); resErr != nil {
+		if resErr := r.getRemoteFile(cfg.AbsBasePath, *cfg.MaxFileSizeBytes, cfg.ThumbnailSizes, db, activeRemoteRequests); resErr != nil {
 			return resErr
 		}
 	}
-	return r.respondFromLocalFile(w, cfg.AbsBasePath)
+	return r.respondFromLocalFile(w, cfg.AbsBasePath, cfg.DynamicThumbnails)
 }
 
 func (r *downloadRequest) getMediaMetadataForRemoteFile(db *storage.Database, activeRemoteRequests *types.ActiveRemoteRequests) (*types.MediaMetadata, *util.JSONResponse) {
@@ -354,7 +449,7 @@ func (r *downloadRequest) getMediaMetadataForRemoteFile(db *storage.Database, ac
 
 // getRemoteFile fetches the file from the remote server and stores its metadata in the database
 // Only the owner of the activeRemoteRequestCondition for this origin and media ID should call this function.
-func (r *downloadRequest) getRemoteFile(absBasePath types.Path, maxFileSizeBytes types.FileSizeBytes, db *storage.Database, activeRemoteRequests *types.ActiveRemoteRequests) *util.JSONResponse {
+func (r *downloadRequest) getRemoteFile(absBasePath types.Path, maxFileSizeBytes types.FileSizeBytes, thumbnailSizes []types.ThumbnailSize, db *storage.Database, activeRemoteRequests *types.ActiveRemoteRequests) *util.JSONResponse {
 	// Wake up other goroutines after this function returns.
 	isError := true
 	defer func() {
@@ -416,7 +511,7 @@ func (r *downloadRequest) getRemoteFile(absBasePath types.Path, maxFileSizeBytes
 		}
 	}
 
-	// TODO: generate thumbnails
+	go thumbnailer.GenerateThumbnails(finalPath, thumbnailSizes, r.Logger)
 
 	r.Logger.WithFields(log.Fields{
 		"MediaID":       r.MediaMetadata.MediaID,
