@@ -15,7 +15,6 @@
 package writers
 
 import (
-	"database/sql"
 	"fmt"
 	"io"
 	"net/http"
@@ -88,7 +87,7 @@ func parseAndValidateRequest(req *http.Request, cfg *config.MediaAPI) (*uploadRe
 			ContentType:   types.ContentType(req.Header.Get("Content-Type")),
 			UploadName:    types.Filename(url.PathEscape(req.FormValue("filename"))),
 		},
-		Logger: util.GetLogger(req.Context()),
+		Logger: util.GetLogger(req.Context()).WithField("Origin", cfg.ServerName),
 	}
 
 	if resErr := r.Validate(*cfg.MaxFileSizeBytes); resErr != nil {
@@ -100,10 +99,9 @@ func parseAndValidateRequest(req *http.Request, cfg *config.MediaAPI) (*uploadRe
 
 func (r *uploadRequest) doUpload(reqReader io.Reader, cfg *config.MediaAPI, db *storage.Database) *util.JSONResponse {
 	r.Logger.WithFields(log.Fields{
-		"Origin":        r.MediaMetadata.Origin,
 		"UploadName":    r.MediaMetadata.UploadName,
 		"FileSizeBytes": r.MediaMetadata.FileSizeBytes,
-		"Content-Type":  r.MediaMetadata.ContentType,
+		"ContentType":   r.MediaMetadata.ContentType,
 	}).Info("Uploading file")
 
 	// The file data is hashed and the hash is used as the MediaID. The hash is useful as a
@@ -113,8 +111,6 @@ func (r *uploadRequest) doUpload(reqReader io.Reader, cfg *config.MediaAPI, db *
 	hash, bytesWritten, tmpDir, err := fileutils.WriteTempFile(reqReader, *cfg.MaxFileSizeBytes, cfg.AbsBasePath)
 	if err != nil {
 		r.Logger.WithError(err).WithFields(log.Fields{
-			"Origin":           r.MediaMetadata.Origin,
-			"MediaID":          r.MediaMetadata.MediaID,
 			"MaxFileSizeBytes": *cfg.MaxFileSizeBytes,
 		}).Warn("Error while transferring file")
 		fileutils.RemoveDir(tmpDir, r.Logger)
@@ -128,18 +124,24 @@ func (r *uploadRequest) doUpload(reqReader io.Reader, cfg *config.MediaAPI, db *
 	r.MediaMetadata.Base64Hash = hash
 	r.MediaMetadata.MediaID = types.MediaID(hash)
 
+	r.Logger = r.Logger.WithField("MediaID", r.MediaMetadata.MediaID)
+
 	r.Logger.WithFields(log.Fields{
-		"MediaID":       r.MediaMetadata.MediaID,
-		"Origin":        r.MediaMetadata.Origin,
 		"Base64Hash":    r.MediaMetadata.Base64Hash,
 		"UploadName":    r.MediaMetadata.UploadName,
 		"FileSizeBytes": r.MediaMetadata.FileSizeBytes,
-		"Content-Type":  r.MediaMetadata.ContentType,
+		"ContentType":   r.MediaMetadata.ContentType,
 	}).Info("File uploaded")
 
 	// check if we already have a record of the media in our database and if so, we can remove the temporary directory
 	mediaMetadata, err := db.GetMediaMetadata(r.MediaMetadata.MediaID, r.MediaMetadata.Origin)
-	if err == nil {
+	if err != nil {
+		r.Logger.WithError(err).Error("Error querying the database.")
+		resErr := jsonerror.InternalServerError()
+		return &resErr
+	}
+
+	if mediaMetadata != nil {
 		r.MediaMetadata = mediaMetadata
 		fileutils.RemoveDir(tmpDir, r.Logger)
 		return &util.JSONResponse{
@@ -148,8 +150,6 @@ func (r *uploadRequest) doUpload(reqReader io.Reader, cfg *config.MediaAPI, db *
 				ContentURI: fmt.Sprintf("mxc://%s/%s", cfg.ServerName, r.MediaMetadata.MediaID),
 			},
 		}
-	} else if err != sql.ErrNoRows {
-		r.Logger.WithError(err).WithField("MediaID", r.MediaMetadata.MediaID).Warn("Failed to query database")
 	}
 
 	if resErr := r.storeFileAndMetadata(tmpDir, cfg.AbsBasePath, db, cfg.ThumbnailSizes); resErr != nil {

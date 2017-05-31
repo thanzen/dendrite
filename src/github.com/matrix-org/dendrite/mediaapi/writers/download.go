@@ -15,7 +15,6 @@
 package writers
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -45,13 +44,6 @@ const mediaIDCharacters = "A-Za-z0-9_=-"
 // Note: unfortunately regex.MustCompile() cannot be assigned to a const
 var mediaIDRegex = regexp.MustCompile("[" + mediaIDCharacters + "]+")
 
-// Error types used by downloadRequest.getMediaMetadata
-// FIXME: make into types
-var (
-	errDBQuery    = fmt.Errorf("error querying database for media")
-	errDBNotFound = fmt.Errorf("media not found")
-)
-
 // downloadRequest metadata included in or derivable from a download or thumbnail request
 // https://matrix.org/docs/spec/client_server/r0.2.0.html#get-matrix-media-r0-download-servername-mediaid
 // http://matrix.org/docs/spec/client_server/r0.2.0.html#get-matrix-media-r0-thumbnail-servername-mediaid
@@ -75,7 +67,10 @@ func Download(w http.ResponseWriter, req *http.Request, origin gomatrixserverlib
 			Origin:  origin,
 		},
 		IsThumbnailRequest: isThumbnailRequest,
-		Logger:             util.GetLogger(req.Context()),
+		Logger: util.GetLogger(req.Context()).WithFields(log.Fields{
+			"Origin":  origin,
+			"MediaID": mediaID,
+		}),
 	}
 
 	if r.IsThumbnailRequest {
@@ -170,15 +165,15 @@ func (r *downloadRequest) Validate() *util.JSONResponse {
 
 func (r *downloadRequest) doDownload(w http.ResponseWriter, cfg *config.MediaAPI, db *storage.Database, activeRemoteRequests *types.ActiveRemoteRequests) *util.JSONResponse {
 	// check if we have a record of the media in our database
-	mediaMetadata, err := r.getMediaMetadata(db)
-	if err == nil {
-		// If we have a record, we can respond from the local file
-		r.MediaMetadata = mediaMetadata
-		return r.respondFromLocalFile(w, cfg.AbsBasePath, cfg.DynamicThumbnails)
-	} else if err == errDBNotFound {
+	mediaMetadata, err := db.GetMediaMetadata(r.MediaMetadata.MediaID, r.MediaMetadata.Origin)
+	if err != nil {
+		r.Logger.WithError(err).Error("Error querying the database.")
+		resErr := jsonerror.InternalServerError()
+		return &resErr
+	}
+	if mediaMetadata == nil {
 		if r.MediaMetadata.Origin == cfg.ServerName {
 			// If we do not have a record and the origin is local, the file is not found
-			r.Logger.WithError(err).Warn("Failed to look up file in database")
 			return &util.JSONResponse{
 				Code: 404,
 				JSON: jsonerror.NotFound(fmt.Sprintf("File with media ID %q does not exist", r.MediaMetadata.MediaID)),
@@ -187,35 +182,9 @@ func (r *downloadRequest) doDownload(w http.ResponseWriter, cfg *config.MediaAPI
 		// If we do not have a record and the origin is remote, we need to fetch it and respond with that file
 		return r.respondFromRemoteFile(w, cfg, db, activeRemoteRequests)
 	}
-	// Another error from the database
-	r.Logger.WithError(err).WithFields(log.Fields{
-		"MediaID": r.MediaMetadata.MediaID,
-		"Origin":  r.MediaMetadata.Origin,
-	}).Error("Error querying the database.")
-	return &util.JSONResponse{
-		Code: 500,
-		JSON: jsonerror.Unknown("Internal server error"),
-	}
-}
-
-// getMediaMetadata queries the database for media metadata
-func (r *downloadRequest) getMediaMetadata(db *storage.Database) (*types.MediaMetadata, error) {
-	mediaMetadata, err := db.GetMediaMetadata(r.MediaMetadata.MediaID, r.MediaMetadata.Origin)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			r.Logger.WithFields(log.Fields{
-				"Origin":  r.MediaMetadata.Origin,
-				"MediaID": r.MediaMetadata.MediaID,
-			}).Info("Media not found in database.")
-			return nil, errDBNotFound
-		}
-		r.Logger.WithError(err).WithFields(log.Fields{
-			"Origin":  r.MediaMetadata.Origin,
-			"MediaID": r.MediaMetadata.MediaID,
-		}).Error("Error querying database for media.")
-		return nil, errDBQuery
-	}
-	return mediaMetadata, nil
+	// If we have a record, we can respond from the local file
+	r.MediaMetadata = mediaMetadata
+	return r.respondFromLocalFile(w, cfg.AbsBasePath, cfg.DynamicThumbnails)
 }
 
 // respondFromLocalFile reads a file from local storage and writes it to the http.ResponseWriter
@@ -223,31 +192,22 @@ func (r *downloadRequest) getMediaMetadata(db *storage.Database) (*types.MediaMe
 func (r *downloadRequest) respondFromLocalFile(w http.ResponseWriter, absBasePath types.Path, dynamicThumbnails bool) *util.JSONResponse {
 	filePath, err := fileutils.GetPathFromBase64Hash(r.MediaMetadata.Base64Hash, absBasePath)
 	if err != nil {
-		// FIXME: Remove erroneous file from database?
-		r.Logger.WithError(err).Warn("Failed to get file path from metadata")
-		return &util.JSONResponse{
-			Code: 404,
-			JSON: jsonerror.NotFound(fmt.Sprintf("File with media ID %q does not exist", r.MediaMetadata.MediaID)),
-		}
+		r.Logger.WithError(err).Error("Failed to get file path from metadata")
+		resErr := jsonerror.InternalServerError()
+		return &resErr
 	}
 	file, err := os.Open(filePath)
-	// FIXME: defer file.Close() ?
+	defer file.Close()
 	if err != nil {
-		// FIXME: Remove erroneous file from database?
-		r.Logger.WithError(err).Warn("Failed to open file")
-		return &util.JSONResponse{
-			Code: 404,
-			JSON: jsonerror.NotFound(fmt.Sprintf("File with media ID %q does not exist", r.MediaMetadata.MediaID)),
-		}
+		r.Logger.WithError(err).Error("Failed to open file")
+		resErr := jsonerror.InternalServerError()
+		return &resErr
 	}
 	stat, err := file.Stat()
 	if err != nil {
-		// FIXME: Remove erroneous file from database?
-		r.Logger.WithError(err).Warn("Failed to stat file")
-		return &util.JSONResponse{
-			Code: 404,
-			JSON: jsonerror.NotFound(fmt.Sprintf("File with media ID %q does not exist", r.MediaMetadata.MediaID)),
-		}
+		r.Logger.WithError(err).Error("Failed to stat file")
+		resErr := jsonerror.InternalServerError()
+		return &resErr
 	}
 
 	if r.MediaMetadata.FileSizeBytes > 0 && int64(r.MediaMetadata.FileSizeBytes) != stat.Size() {
@@ -255,7 +215,8 @@ func (r *downloadRequest) respondFromLocalFile(w http.ResponseWriter, absBasePat
 			"fileSizeDatabase": r.MediaMetadata.FileSizeBytes,
 			"fileSizeDisk":     stat.Size(),
 		}).Warn("File size in database and on-disk differ.")
-		// FIXME: Remove erroneous file from database?
+		resErr := jsonerror.InternalServerError()
+		return &resErr
 	}
 
 	var responseFile *os.File
@@ -310,8 +271,7 @@ func (r *downloadRequest) respondFromLocalFile(w http.ResponseWriter, absBasePat
 			}
 		}
 		// If we have written any data then we have already responded with 200 OK and all we can do is close the connection
-		// FIXME: close the connection here or just return?
-		r.closeConnection(w)
+		return nil
 	}
 	return nil
 }
@@ -346,29 +306,6 @@ func (r *downloadRequest) getThumbnailFile(filePath types.Path, dynamicThumbnail
 	return thumbFile, types.FileSizeBytes(thumbStat.Size()), nil
 }
 
-func (r *downloadRequest) closeConnection(w http.ResponseWriter) {
-	r.Logger.WithFields(log.Fields{
-		"Origin":  r.MediaMetadata.Origin,
-		"MediaID": r.MediaMetadata.MediaID,
-	}).Info("Attempting to close the connection.")
-	hijacker, ok := w.(http.Hijacker)
-	if ok {
-		connection, _, hijackErr := hijacker.Hijack()
-		if hijackErr == nil {
-			r.Logger.WithFields(log.Fields{
-				"Origin":  r.MediaMetadata.Origin,
-				"MediaID": r.MediaMetadata.MediaID,
-			}).Info("Closing")
-			connection.Close()
-		} else {
-			r.Logger.WithError(hijackErr).WithFields(log.Fields{
-				"Origin":  r.MediaMetadata.Origin,
-				"MediaID": r.MediaMetadata.MediaID,
-			}).Warn("Error trying to hijack and close connection")
-		}
-	}
-}
-
 // respondFromRemoteFile fetches the remote file, caches it locally and responds from that local file
 // A hash map of active remote requests to sync.Cond is used to only download remote files once,
 // regardless of how many download requests are received.
@@ -395,14 +332,19 @@ func (r *downloadRequest) getMediaMetadataForRemoteFile(db *storage.Database, ac
 	activeRemoteRequests.Lock()
 	defer activeRemoteRequests.Unlock()
 
-	mediaMetadata, err := r.getMediaMetadata(db)
-	if err == nil {
-		// If we have a record, we can respond from the local file
-		return mediaMetadata, nil
-	} else if err == errDBQuery {
+	// check if we have a record of the media in our database
+	mediaMetadata, err := db.GetMediaMetadata(r.MediaMetadata.MediaID, r.MediaMetadata.Origin)
+	if err != nil {
+		r.Logger.WithError(err).Error("Error querying the database.")
 		resErr := jsonerror.InternalServerError()
 		return nil, &resErr
 	}
+
+	if mediaMetadata != nil {
+		// If we have a record, we can respond from the local file
+		return mediaMetadata, nil
+	}
+
 	// No record was found
 
 	// Check if there is an active remote request for the file
@@ -418,28 +360,28 @@ func (r *downloadRequest) getMediaMetadataForRemoteFile(db *storage.Database, ac
 		// NOTE: there is still a deferred Unlock() that will unlock this
 		activeRemoteRequests.Lock()
 
-		mediaMetadata, err := r.getMediaMetadata(db)
-		if err == nil {
-			r.Logger.WithFields(log.Fields{
-				"Origin":  r.MediaMetadata.Origin,
-				"MediaID": r.MediaMetadata.MediaID,
-			}).Info("Other goroutine fetched the remote file.")
+		// check if we have a record of the media in our database
+		mediaMetadata, err := db.GetMediaMetadata(r.MediaMetadata.MediaID, r.MediaMetadata.Origin)
+		if err != nil {
+			r.Logger.WithError(err).Error("Error querying the database.")
+			resErr := jsonerror.InternalServerError()
+			return nil, &resErr
+		}
+
+		if mediaMetadata != nil {
+			// If we have a record, we can respond from the local file
 			return mediaMetadata, nil
 		}
 
 		r.Logger.WithFields(log.Fields{
 			"Origin":  r.MediaMetadata.Origin,
 			"MediaID": r.MediaMetadata.MediaID,
-		}).Warn("Other goroutine failed to fetch the remote file.")
+		}).Error("Other goroutine failed to fetch the remote file.")
 
-		if err == errDBNotFound {
-			return nil, &util.JSONResponse{
-				Code: 404,
-				JSON: jsonerror.NotFound("File not found."),
-			}
+		return nil, &util.JSONResponse{
+			Code: 404,
+			JSON: jsonerror.NotFound("File not found."),
 		}
-		resErr := jsonerror.InternalServerError()
-		return nil, &resErr
 	}
 
 	// No active remote request so create one
@@ -505,10 +447,8 @@ func (r *downloadRequest) getRemoteFile(absBasePath types.Path, maxFileSizeBytes
 		}
 		// NOTE: It should really not be possible to fail the uniqueness test here so
 		// there is no need to handle that separately
-		return &util.JSONResponse{
-			Code: 500,
-			JSON: jsonerror.InternalServerError(),
-		}
+		resErr := jsonerror.InternalServerError()
+		return &resErr
 	}
 
 	go thumbnailer.GenerateThumbnails(finalPath, thumbnailSizes, r.Logger)
@@ -592,10 +532,8 @@ func (r *downloadRequest) fetchRemoteFile(absBasePath types.Path, maxFileSizeByt
 	finalPath, duplicate, err := fileutils.MoveFileWithHashCheck(tmpDir, r.MediaMetadata, absBasePath, r.Logger)
 	if err != nil {
 		r.Logger.WithError(err).Error("Failed to move file.")
-		return "", false, &util.JSONResponse{
-			Code: 500,
-			JSON: jsonerror.InternalServerError(),
-		}
+		resErr := jsonerror.InternalServerError()
+		return "", false, &resErr
 	}
 	if duplicate {
 		r.Logger.WithField("dst", finalPath).Info("File was stored previously - discarding duplicate")
@@ -614,10 +552,8 @@ func (r *downloadRequest) createRemoteRequest() (*http.Response, *util.JSONRespo
 				JSON: jsonerror.Unknown(fmt.Sprintf("DNS look up for homeserver at %v timed out", r.MediaMetadata.Origin)),
 			}
 		}
-		return nil, &util.JSONResponse{
-			Code: 500,
-			JSON: jsonerror.InternalServerError(),
-		}
+		resErr := jsonerror.InternalServerError()
+		return nil, &resErr
 	}
 	url := "https://" + strings.Trim(dnsResult.SRVRecords[0].Target, ".") + ":" + strconv.Itoa(int(dnsResult.SRVRecords[0].Port))
 
