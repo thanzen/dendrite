@@ -606,11 +606,24 @@ func (r *downloadRequest) fetchRemoteFile(absBasePath types.Path, maxFileSizeByt
 }
 
 func (r *downloadRequest) createRemoteRequest() (*http.Response, *util.JSONResponse) {
-	urls := getMatrixURLs(r.MediaMetadata.Origin)
+	dnsResult, err := gomatrixserverlib.LookupServer(r.MediaMetadata.Origin)
+	if err != nil {
+		if dnsErr, ok := err.(*net.DNSError); ok && dnsErr.Timeout() {
+			return nil, &util.JSONResponse{
+				Code: 504,
+				JSON: jsonerror.Unknown(fmt.Sprintf("DNS look up for homeserver at %v timed out", r.MediaMetadata.Origin)),
+			}
+		}
+		return nil, &util.JSONResponse{
+			Code: 500,
+			JSON: jsonerror.InternalServerError(),
+		}
+	}
+	url := "https://" + strings.Trim(dnsResult.SRVRecords[0].Target, ".") + ":" + strconv.Itoa(int(dnsResult.SRVRecords[0].Port))
 
-	r.Logger.WithField("URL", urls[0]).Info("Connecting to remote")
+	r.Logger.WithField("URL", url).Info("Connecting to remote")
 
-	remoteReqAddr := urls[0] + "/_matrix/media/v1/download/" + string(r.MediaMetadata.Origin) + "/" + string(r.MediaMetadata.MediaID)
+	remoteReqAddr := url + "/_matrix/media/v1/download/" + string(r.MediaMetadata.Origin) + "/" + string(r.MediaMetadata.MediaID)
 	remoteReq, err := http.NewRequest("GET", remoteReqAddr, nil)
 	if err != nil {
 		return nil, &util.JSONResponse{
@@ -654,28 +667,6 @@ func (r *downloadRequest) createRemoteRequest() (*http.Response, *util.JSONRespo
 	}
 
 	return resp, nil
-}
-
-// getMatrixURLs attempts to discover URLs to contact the homeserver
-func getMatrixURLs(serverName gomatrixserverlib.ServerName) []string {
-	_, srvs, err := net.LookupSRV("matrix", "tcp", string(serverName))
-	if err != nil {
-		return []string{"https://" + string(serverName) + ":8448"}
-	}
-
-	results := make([]string, 0, len(srvs))
-	for _, srv := range srvs {
-		if srv == nil {
-			continue
-		}
-
-		url := []string{"https://", strings.Trim(srv.Target, "."), ":", strconv.Itoa(int(srv.Port))}
-		results = append(results, strings.Join(url, ""))
-	}
-
-	// TODO: Order based on priority and weight.
-
-	return results
 }
 
 var contentDispositionRegex = regexp.MustCompile("filename([*])?=(utf-8'')?([A-Za-z0-9._-]+)")
