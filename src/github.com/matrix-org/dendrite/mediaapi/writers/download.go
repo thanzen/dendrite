@@ -261,10 +261,8 @@ func (r *downloadRequest) respondFromLocalFile(w http.ResponseWriter, absBasePat
 	if bytesResponded, err := io.Copy(w, responseFile); err != nil {
 		r.Logger.WithError(err).Warn("Failed to copy from cache")
 		if bytesResponded == 0 {
-			return &util.JSONResponse{
-				Code: 500,
-				JSON: jsonerror.NotFound(fmt.Sprintf("Failed to respond with file with media ID %q", r.MediaMetadata.MediaID)),
-			}
+			resErr := jsonerror.InternalServerError()
+			return &resErr
 		}
 		// If we have written any data then we have already responded with 200 OK and all we can do is close the connection
 		return nil
@@ -301,11 +299,11 @@ func (r *downloadRequest) getThumbnailFile(filePath types.Path, dynamicThumbnail
 }
 
 // respondFromRemoteFile fetches the remote file, caches it locally and responds from that local file
-// A hash map of active remote requests to sync.Cond is used to only download remote files once,
+// A hash map of active remote requests to a struct containing a sync.Cond is used to only download remote files once,
 // regardless of how many download requests are received.
 // Returns a util.JSONResponse error in case of error
 func (r *downloadRequest) respondFromRemoteFile(w http.ResponseWriter, cfg *config.MediaAPI, db *storage.Database, activeRemoteRequests *types.ActiveRemoteRequests) *util.JSONResponse {
-	// FIXME: NOTE LOCKING
+	// Note: getMediaMetadataForRemoteFile uses mutexes and conditions from activeRemoteRequests
 	mediaMetadata, resErr := r.getMediaMetadataForRemoteFile(db, activeRemoteRequests)
 	if resErr != nil {
 		return resErr
@@ -313,8 +311,8 @@ func (r *downloadRequest) respondFromRemoteFile(w http.ResponseWriter, cfg *conf
 		// If we have a record, we can respond from the local file
 		r.MediaMetadata = mediaMetadata
 	} else {
-		// If we have a record, we can respond from the local file
-		// FIXME: NOTE LOCKING
+		// If we do not have a record, we need to fetch the remote file first and then respond from the local file
+		// Note: getRemoteFile uses mutexes and conditions from activeRemoteRequests
 		if resErr := r.getRemoteFile(cfg.AbsBasePath, *cfg.MaxFileSizeBytes, cfg.ThumbnailSizes, db, activeRemoteRequests); resErr != nil {
 			return resErr
 		}
@@ -346,10 +344,8 @@ func (r *downloadRequest) getMediaMetadataForRemoteFile(db *storage.Database, ac
 	if activeRemoteRequestResult, ok := activeRemoteRequests.MXCToResult[mxcURL]; ok {
 		r.Logger.Info("Waiting for another goroutine to fetch the remote file.")
 
+		// NOTE: Wait unlocks and locks again internally. There is still a deferred Unlock() that will unlock this.
 		activeRemoteRequestResult.Cond.Wait()
-		activeRemoteRequests.Unlock()
-		// NOTE: there is still a deferred Unlock() that will unlock this
-		activeRemoteRequests.Lock()
 
 		// check if we have a record of the media in our database
 		mediaMetadata, err := db.GetMediaMetadata(r.MediaMetadata.MediaID, r.MediaMetadata.Origin)
@@ -523,7 +519,6 @@ func (r *downloadRequest) fetchRemoteFile(absBasePath types.Path, maxFileSizeByt
 	// file.
 	r.MediaMetadata.FileSizeBytes = types.FileSizeBytes(bytesWritten)
 	r.MediaMetadata.Base64Hash = hash
-	// r.MediaMetadata.UserID = types.MatrixUserID("@:" + string(r.MediaMetadata.Origin))
 
 	// The database is the source of truth so we need to have moved the file first
 	finalPath, duplicate, err := fileutils.MoveFileWithHashCheck(tmpDir, r.MediaMetadata, absBasePath, r.Logger)
@@ -559,10 +554,8 @@ func (r *downloadRequest) createRemoteRequest() (*http.Response, *util.JSONRespo
 	remoteReqAddr := url + "/_matrix/media/v1/download/" + string(r.MediaMetadata.Origin) + "/" + string(r.MediaMetadata.MediaID)
 	remoteReq, err := http.NewRequest("GET", remoteReqAddr, nil)
 	if err != nil {
-		return nil, &util.JSONResponse{
-			Code: 500,
-			JSON: jsonerror.Unknown(fmt.Sprintf("File with media ID %q could not be downloaded from %q", r.MediaMetadata.MediaID, r.MediaMetadata.Origin)),
-		}
+		resErr := jsonerror.InternalServerError()
+		return nil, &resErr
 	}
 
 	remoteReq.Header.Set("Host", string(r.MediaMetadata.Origin))
@@ -570,6 +563,7 @@ func (r *downloadRequest) createRemoteRequest() (*http.Response, *util.JSONRespo
 	client := http.Client{}
 	resp, err := client.Do(remoteReq)
 	if err != nil {
+		r.Logger.Warn("Failed to execute request for remote file")
 		return nil, &util.JSONResponse{
 			Code: 502,
 			JSON: jsonerror.Unknown(fmt.Sprintf("File with media ID %q could not be downloaded from %q", r.MediaMetadata.MediaID, r.MediaMetadata.Origin)),
@@ -585,7 +579,7 @@ func (r *downloadRequest) createRemoteRequest() (*http.Response, *util.JSONRespo
 		}
 		r.Logger.WithFields(log.Fields{
 			"StatusCode": resp.StatusCode,
-		}).Info("Received error response")
+		}).Warn("Received error response")
 		return nil, &util.JSONResponse{
 			Code: 502,
 			JSON: jsonerror.Unknown(fmt.Sprintf("File with media ID %q could not be downloaded from %q", r.MediaMetadata.MediaID, r.MediaMetadata.Origin)),
