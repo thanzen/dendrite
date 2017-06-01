@@ -76,61 +76,33 @@ func GetThumbnailPath(src types.Path, config types.ThumbnailSize) types.Path {
 
 // createThumbnail checks if the thumbnail exists, and if not, generates it
 // Thumbnail generation is only done once for each non-existing thumbnail.
-func createThumbnail(src types.Path, buffer []byte, config types.ThumbnailSize, activeThumbnailGeneration *types.ActiveThumbnailGeneration, logger *log.Entry) (retErr error) {
+func createThumbnail(src types.Path, buffer []byte, config types.ThumbnailSize, activeThumbnailGeneration *types.ActiveThumbnailGeneration, logger *log.Entry) (errorReturn error) {
 	dst := GetThumbnailPath(src, config)
 
-	// Wake up other goroutines after this function returns.
-	isGenerator := false
-	defer func() {
-		defer activeThumbnailGeneration.Unlock()
-		if isGenerator {
-			// Note: Unlocked during generation so need to take the lock back
-			activeThumbnailGeneration.Lock()
-			if activeThumbnailGenerationResult, ok := activeThumbnailGeneration.PathToResult[string(dst)]; ok {
-				logger.WithFields(log.Fields{
-					"Width":        config.Width,
-					"Height":       config.Height,
-					"ResizeMethod": config.ResizeMethod,
-				}).Info("Signalling other goroutines waiting for this goroutine to generate the thumbnail.")
-				// Note: retErr is a named return value error that is signalled from here to waiting goroutines
-				activeThumbnailGenerationResult.Err = retErr
-				activeThumbnailGenerationResult.Cond.Broadcast()
-			}
-			delete(activeThumbnailGeneration.PathToResult, string(dst))
-		}
-	}()
+	// Note: getActiveThumbnailGeneration uses mutexes and conditions from activeThumbnailGeneration
+	isActive, err := getActiveThumbnailGeneration(dst, config, activeThumbnailGeneration, logger)
+	if err != nil {
+		return err
+	}
 
-	activeThumbnailGeneration.Lock()
+	if isActive {
+		// Note: This is an active request that MUST broadcastGeneration to wake up waiting goroutines!
+		// Note: errorReturn is the named return variable
+		// Note: broadcastGeneration uses mutexes and conditions from activeThumbnailGeneration
+		defer broadcastGeneration(dst, activeThumbnailGeneration, config, errorReturn, logger)
+	}
 
 	// Check if the thumbnail exists.
 	// Note: The double-negative is intentional as os.IsExist(err) != !os.IsNotExist(err).
 	// The functions are error checkers to be used in different cases.
-	if _, err := os.Stat(string(dst)); !os.IsNotExist(err) {
+	if _, err = os.Stat(string(dst)); !os.IsNotExist(err) {
 		// Thumbnail exists
 		return nil
 	}
-
-	// Check if ther is active thumbnail generation.
-	if activeThumbnailGenerationResult, ok := activeThumbnailGeneration.PathToResult[string(dst)]; ok {
-		logger.WithFields(log.Fields{
-			"Width":        config.Width,
-			"Height":       config.Height,
-			"ResizeMethod": config.ResizeMethod,
-		}).Info("Waiting for another goroutine to generate the thumbnail.")
-
-		// NOTE: Wait unlocks and locks again internally. There is still a deferred Unlock() that will unlock this.
-		activeThumbnailGenerationResult.Cond.Wait()
-		// Note: either there is an error or it is nil, either way returning it is correct
-		return activeThumbnailGenerationResult.Err
+	if isActive == false {
+		// Note: This should not happen, but we check just in case.
+		return fmt.Errorf("Not active thumbnail generator. Stat error: %q", err)
 	}
-
-	// No active thumbnail generation so create one
-	isGenerator = true
-	activeThumbnailGeneration.PathToResult[string(dst)] = &types.ThumbnailGenerationResult{
-		Cond: &sync.Cond{L: activeThumbnailGeneration},
-	}
-	// Note: Unlock during generation. The lock is taken back in the deferred function above.
-	activeThumbnailGeneration.Unlock()
 
 	logger.WithFields(log.Fields{
 		"Width":        config.Width,
@@ -148,6 +120,50 @@ func createThumbnail(src types.Path, buffer []byte, config types.ThumbnailSize, 
 		"processTime":  time.Now().Sub(start),
 	}).Info("Generated thumbnail")
 	return nil
+}
+
+// getActiveThumbnailGeneration checks for active thumbnail generation
+func getActiveThumbnailGeneration(dst types.Path, config types.ThumbnailSize, activeThumbnailGeneration *types.ActiveThumbnailGeneration, logger *log.Entry) (bool, error) {
+	// Check if there is active thumbnail generation.
+	activeThumbnailGeneration.Lock()
+	defer activeThumbnailGeneration.Unlock()
+	if activeThumbnailGenerationResult, ok := activeThumbnailGeneration.PathToResult[string(dst)]; ok {
+		logger.WithFields(log.Fields{
+			"Width":        config.Width,
+			"Height":       config.Height,
+			"ResizeMethod": config.ResizeMethod,
+		}).Info("Waiting for another goroutine to generate the thumbnail.")
+
+		// NOTE: Wait unlocks and locks again internally. There is still a deferred Unlock() that will unlock this.
+		activeThumbnailGenerationResult.Cond.Wait()
+		// Note: either there is an error or it is nil, either way returning it is correct
+		return false, activeThumbnailGenerationResult.Err
+	}
+
+	// No active thumbnail generation so create one
+	activeThumbnailGeneration.PathToResult[string(dst)] = &types.ThumbnailGenerationResult{
+		Cond: &sync.Cond{L: activeThumbnailGeneration},
+	}
+
+	return true, nil
+}
+
+// broadcastGeneration broadcasts that thumbnail generation completed and the error to all waiting goroutines
+// Note: This should only be called by the owner of the activeThumbnailGenerationResult
+func broadcastGeneration(dst types.Path, activeThumbnailGeneration *types.ActiveThumbnailGeneration, config types.ThumbnailSize, errorReturn error, logger *log.Entry) {
+	activeThumbnailGeneration.Lock()
+	defer activeThumbnailGeneration.Unlock()
+	if activeThumbnailGenerationResult, ok := activeThumbnailGeneration.PathToResult[string(dst)]; ok {
+		logger.WithFields(log.Fields{
+			"Width":        config.Width,
+			"Height":       config.Height,
+			"ResizeMethod": config.ResizeMethod,
+		}).Info("Signalling other goroutines waiting for this goroutine to generate the thumbnail.")
+		// Note: retErr is a named return value error that is signalled from here to waiting goroutines
+		activeThumbnailGenerationResult.Err = errorReturn
+		activeThumbnailGenerationResult.Cond.Broadcast()
+	}
+	delete(activeThumbnailGeneration.PathToResult, string(dst))
 }
 
 // resize scales an image to fit within the provided width and height
