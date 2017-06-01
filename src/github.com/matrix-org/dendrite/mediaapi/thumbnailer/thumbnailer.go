@@ -89,7 +89,9 @@ func createThumbnail(src types.Path, buffer []byte, config types.ThumbnailSize, 
 		// Note: This is an active request that MUST broadcastGeneration to wake up waiting goroutines!
 		// Note: errorReturn is the named return variable
 		// Note: broadcastGeneration uses mutexes and conditions from activeThumbnailGeneration
-		defer broadcastGeneration(dst, activeThumbnailGeneration, config, errorReturn, logger)
+		defer func() {
+			broadcastGeneration(dst, activeThumbnailGeneration, config, errorReturn, logger)
+		}()
 	}
 
 	// Check if the thumbnail exists.
