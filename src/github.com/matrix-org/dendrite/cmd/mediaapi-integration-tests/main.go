@@ -28,7 +28,7 @@ const mediaID = "rZOBfBHnuOoyqBKUIHAaSbcM"
 const requestCount = 100
 
 func main() {
-	httpURL := "http://localhost:7779/api/_matrix/media/v1/download/" + origin + "/" + mediaID
+	httpURL := "http://localhost:7779/api/_matrix/media/v1/thumbnail/" + origin + "/" + mediaID + "?width=800&height=600"
 	jsonResponses := make(chan string)
 
 	var wg sync.WaitGroup

@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
@@ -29,33 +30,24 @@ import (
 const thumbnailTemplate = "thumbnail-%vx%v-%v"
 
 // GenerateThumbnails generates the configured thumbnail sizes for the source file
-func GenerateThumbnails(src types.Path, configs []types.ThumbnailSize, logger *log.Entry) error {
-	start := time.Now()
+func GenerateThumbnails(src types.Path, configs []types.ThumbnailSize, activeThumbnailGeneration *types.ActiveThumbnailGeneration, logger *log.Entry) error {
 	buffer, err := bimg.Read(string(src))
 	if err != nil {
-		logger.WithError(err).WithFields(log.Fields{
-			"src": src,
-		}).Error("Failed to read src file")
+		logger.WithError(err).WithField("src", src).Error("Failed to read src file")
 		return err
 	}
 	for _, config := range configs {
-		if err = createThumbnail(src, buffer, config, logger); err != nil {
-			logger.WithError(err).WithFields(log.Fields{
-				"src": src,
-			}).Error("Failed to generate thumbnails")
+		// Note: createThumbnail does locking based on activeThumbnailGeneration
+		if err = createThumbnail(src, buffer, config, activeThumbnailGeneration, logger); err != nil {
+			logger.WithError(err).WithField("src", src).Error("Failed to generate thumbnails")
 			return err
 		}
 	}
-	logger.WithFields(log.Fields{
-		"src":         src,
-		"processTime": time.Now().Sub(start),
-	}).Info("Generated thumbnails")
 	return nil
 }
 
 // GenerateThumbnail generates the configured thumbnail size for the source file
-func GenerateThumbnail(src types.Path, config types.ThumbnailSize, logger *log.Entry) error {
-	start := time.Now()
+func GenerateThumbnail(src types.Path, config types.ThumbnailSize, activeThumbnailGeneration *types.ActiveThumbnailGeneration, logger *log.Entry) error {
 	buffer, err := bimg.Read(string(src))
 	if err != nil {
 		logger.WithError(err).WithFields(log.Fields{
@@ -63,16 +55,13 @@ func GenerateThumbnail(src types.Path, config types.ThumbnailSize, logger *log.E
 		}).Error("Failed to read src file")
 		return err
 	}
-	if err = createThumbnail(src, buffer, config, logger); err != nil {
+	// Note: createThumbnail does locking based on activeThumbnailGeneration
+	if err = createThumbnail(src, buffer, config, activeThumbnailGeneration, logger); err != nil {
 		logger.WithError(err).WithFields(log.Fields{
 			"src": src,
 		}).Error("Failed to generate thumbnails")
 		return err
 	}
-	logger.WithFields(log.Fields{
-		"src":         src,
-		"processTime": time.Now().Sub(start),
-	}).Info("Generated thumbnail")
 	return nil
 }
 
@@ -85,17 +74,79 @@ func GetThumbnailPath(src types.Path, config types.ThumbnailSize) types.Path {
 	))
 }
 
-func createThumbnail(src types.Path, buffer []byte, config types.ThumbnailSize, logger *log.Entry) error {
+// createThumbnail checks if the thumbnail exists, and if not, generates it
+// Thumbnail generation is only done once for each non-existing thumbnail.
+func createThumbnail(src types.Path, buffer []byte, config types.ThumbnailSize, activeThumbnailGeneration *types.ActiveThumbnailGeneration, logger *log.Entry) (retErr error) {
 	dst := GetThumbnailPath(src, config)
+
+	// Wake up other goroutines after this function returns.
+	isGenerator := false
+	defer func() {
+		defer activeThumbnailGeneration.Unlock()
+		if isGenerator {
+			// Note: Unlocked during generation so need to take the lock back
+			activeThumbnailGeneration.Lock()
+			if activeThumbnailGenerationResult, ok := activeThumbnailGeneration.PathToResult[string(dst)]; ok {
+				logger.WithFields(log.Fields{
+					"Width":        config.Width,
+					"Height":       config.Height,
+					"ResizeMethod": config.ResizeMethod,
+				}).Info("Signalling other goroutines waiting for this goroutine to generate the thumbnail.")
+				// Note: retErr is a named return value error that is signalled from here to waiting goroutines
+				activeThumbnailGenerationResult.Err = retErr
+				activeThumbnailGenerationResult.Cond.Broadcast()
+			}
+			delete(activeThumbnailGeneration.PathToResult, string(dst))
+		}
+	}()
+
+	activeThumbnailGeneration.Lock()
+
+	// Check if the thumbnail exists.
 	// Note: The double-negative is intentional as os.IsExist(err) != !os.IsNotExist(err).
 	// The functions are error checkers to be used in different cases.
 	if _, err := os.Stat(string(dst)); !os.IsNotExist(err) {
-		logger.WithField("dst", dst).Info("Thumbnail exists")
+		// Thumbnail exists
 		return nil
 	}
+
+	// Check if ther is active thumbnail generation.
+	if activeThumbnailGenerationResult, ok := activeThumbnailGeneration.PathToResult[string(dst)]; ok {
+		logger.WithFields(log.Fields{
+			"Width":        config.Width,
+			"Height":       config.Height,
+			"ResizeMethod": config.ResizeMethod,
+		}).Info("Waiting for another goroutine to generate the thumbnail.")
+
+		// NOTE: Wait unlocks and locks again internally. There is still a deferred Unlock() that will unlock this.
+		activeThumbnailGenerationResult.Cond.Wait()
+		// Note: either there is an error or it is nil, either way returning it is correct
+		return activeThumbnailGenerationResult.Err
+	}
+
+	// No active thumbnail generation so create one
+	isGenerator = true
+	activeThumbnailGeneration.PathToResult[string(dst)] = &types.ThumbnailGenerationResult{
+		Cond: &sync.Cond{L: activeThumbnailGeneration},
+	}
+	// Note: Unlock during generation. The lock is taken back in the deferred function above.
+	activeThumbnailGeneration.Unlock()
+
+	logger.WithFields(log.Fields{
+		"Width":        config.Width,
+		"Height":       config.Height,
+		"ResizeMethod": config.ResizeMethod,
+	}).Info("Generating thumbnail")
+	start := time.Now()
 	if err := resize(dst, buffer, config.Width, config.Height, config.ResizeMethod == "crop", logger); err != nil {
 		return err
 	}
+	logger.WithFields(log.Fields{
+		"Width":        config.Width,
+		"Height":       config.Height,
+		"ResizeMethod": config.ResizeMethod,
+		"processTime":  time.Now().Sub(start),
+	}).Info("Generated thumbnail")
 	return nil
 }
 
