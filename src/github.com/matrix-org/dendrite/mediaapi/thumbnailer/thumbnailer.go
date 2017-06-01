@@ -90,6 +90,10 @@ func createThumbnail(src types.Path, buffer []byte, config types.ThumbnailSize, 
 		// Note: broadcastGeneration uses mutexes and conditions from activeThumbnailGeneration
 		defer func() {
 			// Note: errorReturn is the named return variable so we wrap this in a closure to re-evaluate the arguments at defer-time
+			if err := recover(); err != nil {
+				broadcastGeneration(dst, activeThumbnailGeneration, config, err.(error), logger)
+				panic(err)
+			}
 			broadcastGeneration(dst, activeThumbnailGeneration, config, errorReturn, logger)
 		}()
 	}
